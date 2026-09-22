@@ -5,6 +5,7 @@ FuelShare is a mobile-first shared scooter-petrol ledger for a trusted group of 
 ## Product rules
 
 - A refill records its payer, amount paid, pump price, calculated litres, and time. It creates a payer-owned fuel batch.
+- A refill marked as full calibrates the estimated pre-refill balance from the tank capacity and actual pump litres.
 - A ride records its rider and kilometres. It consumes fuel using the scooter mileage captured at the time of that ride.
 - Fuel is consumed from refill batches oldest-first, preserving the actual price of the petrol used.
 - A member consuming fuel they purchased creates no debt. Other consumption credits the batch owner and debits the rider.

@@ -17,11 +17,13 @@ Open `http://localhost:3000`. Without environment variables, FuelShare automatic
 
 1. Create a Supabase project.
 2. In Supabase Authentication settings, enable Anonymous Sign-Ins.
-3. Run [`supabase/migrations/001_initial.sql`](supabase/migrations/001_initial.sql) in the Supabase SQL editor.
+3. Run the SQL files in [`supabase/migrations`](supabase/migrations) in numeric order in the Supabase SQL editor.
 4. Copy `.env.example` to `.env.local` and add the project URL and publishable/anon key.
 5. Restart `npm run dev`.
 
-The migration creates the schema, validation triggers, correction audit log, row-level access policies, invite RPCs, and realtime publication. Do not put a Supabase service-role key in the frontend environment.
+The migrations create the schema, validation triggers, correction audit log, row-level access policies, invite RPCs, and realtime publication. Do not put a Supabase service-role key in the frontend environment.
+
+When a refill reaches the brim, select **Filled the tank completely**. FuelShare uses the purchased litres and configured tank capacity to reset estimation drift while keeping previously accounted fuel from being charged twice.
 
 The production PWA caches its application shell. New rides, refills, and repayments entered while offline are kept on the device, shown as pending, and retried when the app reconnects. Client-generated event IDs make retries idempotent.
 

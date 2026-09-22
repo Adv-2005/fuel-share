@@ -11,7 +11,7 @@ import type {
 } from "@/lib/types";
 
 interface FuelLot {
-  ownerMemberId: string;
+  ownerMemberId: string | null;
   remainingMl: number;
   remainingValuePaise: number;
 }
@@ -87,11 +87,39 @@ export function calculateLedger(
 
   const lots: FuelLot[] = [];
   const issues: DashboardSnapshot["issues"] = [];
+  const calibrations: DashboardSnapshot["calibrations"] = [];
   let tankMl = 0;
 
   for (const event of chronologicalTankEvents(purchases, rides)) {
     if (event.type === "fuel") {
       const purchase = event.value;
+      if (purchase.isFullTank) {
+        const estimatedBeforeMl = Math.max(0, lots.reduce((sum, lot) => sum + lot.remainingMl, 0));
+        const actualBeforeMl = Math.max(0, group.tankCapacityMl - purchase.volumeMl);
+        const adjustmentMl = actualBeforeMl - estimatedBeforeMl;
+
+        if (adjustmentMl < 0) {
+          let correctionMl = -adjustmentMl;
+          for (const lot of lots) {
+            if (correctionMl <= 0) break;
+            if (lot.remainingMl <= 0) continue;
+            const removedMl = Math.min(correctionMl, lot.remainingMl);
+            const removedValuePaise = removedMl === lot.remainingMl
+              ? lot.remainingValuePaise
+              : Math.round((lot.remainingValuePaise * removedMl) / lot.remainingMl);
+            lot.remainingMl -= removedMl;
+            lot.remainingValuePaise -= removedValuePaise;
+            correctionMl -= removedMl;
+          }
+        } else if (adjustmentMl > 0) {
+          // This fuel was already treated as consumed. Keeping it unowned avoids
+          // charging its value to a second rider after calibration.
+          lots.push({ ownerMemberId: null, remainingMl: adjustmentMl, remainingValuePaise: 0 });
+        }
+
+        calibrations.push({ eventId: purchase.id, estimatedBeforeMl, actualBeforeMl, adjustmentMl });
+        tankMl = actualBeforeMl;
+      }
       tankMl += purchase.volumeMl;
       lots.push({
         ownerMemberId: purchase.payerMemberId,
@@ -132,7 +160,7 @@ export function calculateLedger(
       lot.remainingValuePaise -= consumedCost;
       requiredMl -= consumedMl;
 
-      if (lot.ownerMemberId !== ride.riderMemberId) {
+      if (lot.ownerMemberId && lot.ownerMemberId !== ride.riderMemberId) {
         const ownerBalance = balances.get(lot.ownerMemberId);
         if (ownerBalance) ownerBalance.balancePaise += consumedCost;
         if (riderBalance) riderBalance.balancePaise -= consumedCost;
@@ -150,7 +178,7 @@ export function calculateLedger(
 
   const fuelOwnerMap = new Map<string, FuelOwnerPosition>();
   for (const lot of lots) {
-    if (lot.remainingMl <= 0) continue;
+    if (lot.remainingMl <= 0 || !lot.ownerMemberId) continue;
     const current = fuelOwnerMap.get(lot.ownerMemberId) ?? {
       memberId: lot.ownerMemberId,
       remainingMl: 0,
@@ -165,14 +193,17 @@ export function calculateLedger(
   const memberNames = new Map(members.map((member) => [member.id, member.displayName]));
   const remainingMl = Math.max(0, lots.reduce((sum, lot) => sum + lot.remainingMl, 0));
   const remainingValuePaise = lots.reduce((sum, lot) => sum + lot.remainingValuePaise, 0);
+  const unattributedMl = lots.reduce((sum, lot) => sum + (lot.ownerMemberId ? 0 : lot.remainingMl), 0);
 
   return {
     tank: {
       remainingMl,
       remainingValuePaise,
+      unattributedMl,
       capacityMl: group.tankCapacityMl,
       percent: group.tankCapacityMl > 0 ? Math.min(100, Math.max(0, (remainingMl / group.tankCapacityMl) * 100)) : 0,
     },
+    calibrations,
     fuelOwners: [...fuelOwnerMap.values()].sort((a, b) => b.remainingValuePaise - a.remainingValuePaise),
     memberBalances,
     suggestedTransfers: buildTransfers(memberBalances, memberNames),
