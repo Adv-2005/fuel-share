@@ -301,6 +301,11 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
     .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)), [data]);
   const inviteUrl = typeof window === "undefined" ? "" : `${window.location.origin}/join/${data.group.inviteCode}`;
   const latestCalibration = snapshot.calibrations.at(-1);
+  const calibrationByEventId = new Map(snapshot.calibrations.map((calibration) => [calibration.eventId, calibration]));
+
+  function signedLitres(millilitres: number): string {
+    return `${millilitres >= 0 ? "+" : "−"}${formatLitres(Math.abs(millilitres))}`;
+  }
 
   async function copyInvite() {
     await navigator.clipboard.writeText(inviteUrl);
@@ -309,10 +314,16 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
   }
 
   function eventSummary(event: LedgerEvent): { icon: React.ReactNode; title: string; detail: string; amount?: string } {
-    if (event.kind === "fuel_purchase") return {
-      icon: <Fuel />, title: `${memberName(data, event.payerMemberId)} refilled`,
-      detail: `${formatLitres(event.volumeMl)} at ${formatMoney(event.unitPricePaisePerLitre)}/L${event.isFullTank ? " · full-tank calibration" : ""}`, amount: formatMoney(event.amountPaise),
-    };
+    if (event.kind === "fuel_purchase") {
+      const calibration = calibrationByEventId.get(event.id);
+      const calibrationDetail = calibration
+        ? ` · full-tank calibration: ${formatLitres(calibration.estimatedBeforeMl)} estimated → ${formatLitres(calibration.actualBeforeMl)} actual (${signedLitres(calibration.adjustmentMl)})`
+        : "";
+      return {
+        icon: <Fuel />, title: `${memberName(data, event.payerMemberId)} refilled`,
+        detail: `${formatLitres(event.volumeMl)} at ${formatMoney(event.unitPricePaisePerLitre)}/L${calibrationDetail}`, amount: formatMoney(event.amountPaise),
+      };
+    }
     if (event.kind === "ride") return {
       icon: <Bike />, title: `${memberName(data, event.riderMemberId)} rode`,
       detail: `${formatLitres(event.consumedMl)} estimated use`, amount: formatDistance(event.distanceM),
@@ -327,7 +338,8 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
     const numberValue = (camel: string, snake: string): number => Number(previous[camel] ?? previous[snake] ?? 0);
     if (kind === "ride") return `${formatDistance(numberValue("distanceM", "distance_m"))} ride`;
     if (kind === "fuel_purchase") {
-      return `${formatMoney(numberValue("amountPaise", "amount_paise"))} refill at ${formatMoney(numberValue("unitPricePaisePerLitre", "unit_price_paise_per_litre"))}/L`;
+      const wasFullTank = previous.isFullTank === true || previous.is_full_tank === true;
+      return `${formatMoney(numberValue("amountPaise", "amount_paise"))} refill at ${formatMoney(numberValue("unitPricePaisePerLitre", "unit_price_paise_per_litre"))}/L${wasFullTank ? " · full-tank calibration" : ""}`;
     }
     return `${formatMoney(numberValue("amountPaise", "amount_paise"))} repayment`;
   }
@@ -363,7 +375,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
           {latestCalibration && (
             <div className="calibration-note">
               <Check />
-              <span>Before the last full refill, FuelShare estimated {formatLitres(latestCalibration.estimatedBeforeMl)} and the pump showed {formatLitres(latestCalibration.actualBeforeMl)}. Corrected by <strong>{latestCalibration.adjustmentMl >= 0 ? "+" : "−"}{formatLitres(Math.abs(latestCalibration.adjustmentMl))}</strong>.</span>
+              <span>Before the last full refill, FuelShare estimated {formatLitres(latestCalibration.estimatedBeforeMl)} and the pump showed {formatLitres(latestCalibration.actualBeforeMl)}. Corrected by <strong>{signedLitres(latestCalibration.adjustmentMl)}</strong>.</span>
             </div>
           )}
 
