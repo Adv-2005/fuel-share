@@ -127,6 +127,44 @@ describe("FuelShareApp", () => {
     expect(screen.getByText(/1.5 L opening fuel worth ₹150/)).toBeInTheDocument();
   });
 
+  it("shows full-tank adjustment details and status in activity history", async () => {
+    const occurredAt = "2026-01-02T10:00:00.000Z";
+    const data: GroupData = {
+      group: {
+        id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000,
+        mileageMPerLitre: 45_000, adminUserId: "user", setupStatus: "complete", createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      members: [{ id: "member", groupId: "group", userId: "user", displayName: "Alice", role: "admin", createdAt: "2026-01-01T00:00:00.000Z" }],
+      openingBalances: [],
+      purchases: [{
+        id: "full-refill", kind: "fuel_purchase", groupId: "group", payerMemberId: "member", createdByUserId: "user",
+        amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000, isFullTank: true,
+        occurredAt, createdAt: occurredAt, updatedAt: occurredAt, deletedAt: null, note: "",
+      }],
+      rides: [], payments: [],
+      revisions: [
+        {
+          id: "cloud-revision", groupId: "group", entityType: "fuel_purchase", entityId: "full-refill", changedByUserId: "user",
+          previousData: { amount_paise: 50_000, unit_price_paise_per_litre: 10_000, is_full_tank: true }, createdAt: "2026-01-03T00:00:00.000Z",
+        },
+        {
+          id: "local-revision", groupId: "group", entityType: "fuel_purchase", entityId: "full-refill", changedByUserId: "user",
+          previousData: { amountPaise: 50_000, unitPricePaisePerLitre: 10_000, isFullTank: true }, createdAt: "2026-01-04T00:00:00.000Z",
+        },
+      ],
+      currentUserId: "user", currentMemberId: "member", pendingEventIds: [], mode: "local",
+    };
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+
+    render(<FuelShareApp />);
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+
+    expect(screen.getByText(/full-tank calibration: 0\.00 L estimated.*5\.0 L actual \(\+5\.0 L\)/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "2 corrections recorded" }));
+    expect(screen.getAllByText(/₹500 refill at ₹100\/L.*full-tank calibration/)).toHaveLength(2);
+  });
+
   it("blocks ride and refill actions while showing the finish-setup action", async () => {
     const pending: GroupData = {
       group: {
