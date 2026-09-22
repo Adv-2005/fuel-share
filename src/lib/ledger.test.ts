@@ -22,7 +22,7 @@ const members: Member[] = [
 function purchase(overrides: Partial<FuelPurchase> = {}): FuelPurchase {
   return {
     id: "fuel-1", kind: "fuel_purchase", groupId: "group", payerMemberId: "alice", createdByUserId: "alice-user",
-    amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000,
+    amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000, isFullTank: false,
     occurredAt: "2026-01-01T10:00:00.000Z", createdAt: group.createdAt, updatedAt: group.createdAt, deletedAt: null, note: "", ...overrides,
   };
 }
@@ -65,6 +65,54 @@ it("allocates fuel FIFO at each purchase price", () => {
   expect(result.memberBalances.find((item) => item.memberId === "alice")?.balancePaise).toBe(20_000);
   expect(result.memberBalances.find((item) => item.memberId === "cara")?.balancePaise).toBe(12_000);
   expect(result.tank.remainingValuePaise).toBe(24_000);
+});
+
+describe("full-tank calibration", () => {
+  it("raises an underestimated balance to the actual pre-refill level", () => {
+    const fullRefill = purchase({
+      id: "full-refill",
+      amountPaise: 50_000,
+      volumeMl: 5_000,
+      isFullTank: true,
+      occurredAt: "2026-01-03T10:00:00.000Z",
+    });
+
+    const result = calculateLedger(group, members, [purchase(), fullRefill], [ride()], []);
+
+    expect(result.tank.remainingMl).toBe(10_000);
+    expect(result.tank.unattributedMl).toBe(1_000);
+    expect(result.tank.remainingValuePaise).toBe(90_000);
+    expect(result.calibrations).toEqual([{
+      eventId: "full-refill",
+      estimatedBeforeMl: 4_000,
+      actualBeforeMl: 5_000,
+      adjustmentMl: 1_000,
+    }]);
+    expect(result.issues).toEqual([]);
+  });
+
+  it("reduces an overestimated balance before adding the full refill", () => {
+    const fullRefill = purchase({
+      id: "full-refill",
+      amountPaise: 70_000,
+      volumeMl: 7_000,
+      isFullTank: true,
+      occurredAt: "2026-01-03T10:00:00.000Z",
+    });
+
+    const result = calculateLedger(group, members, [purchase(), fullRefill], [ride()], []);
+
+    expect(result.tank.remainingMl).toBe(10_000);
+    expect(result.tank.unattributedMl).toBe(0);
+    expect(result.tank.remainingValuePaise).toBe(100_000);
+    expect(result.calibrations[0]?.adjustmentMl).toBe(-1_000);
+    expect(result.issues).toEqual([]);
+  });
+
+  it("still rejects a full refill larger than tank capacity", () => {
+    const result = calculateLedger(group, members, [purchase({ volumeMl: 11_000, isFullTank: true })], [], []);
+    expect(result.issues[0]?.code).toBe("tank_overflow");
+  });
 });
 
 it("nets payments and simplifies transfers", () => {

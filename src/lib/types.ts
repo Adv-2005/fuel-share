@@ -39,6 +39,7 @@ export interface FuelPurchase extends BaseEvent {
   amountPaise: number;
   unitPricePaisePerLitre: number;
   volumeMl: number;
+  isFullTank: boolean;
 }
 
 export interface Ride extends BaseEvent {
@@ -95,13 +96,22 @@ export interface LedgerIssue {
   message: string;
 }
 
+export interface FuelCalibration {
+  eventId: string;
+  estimatedBeforeMl: number;
+  actualBeforeMl: number;
+  adjustmentMl: number;
+}
+
 export interface DashboardSnapshot {
   tank: {
     remainingMl: number;
     remainingValuePaise: number;
+    unattributedMl: number;
     capacityMl: number;
     percent: number;
   };
+  calibrations: FuelCalibration[];
   fuelOwners: FuelOwnerPosition[];
   memberBalances: MemberBalance[];
   suggestedTransfers: SuggestedTransfer[];
@@ -140,6 +150,7 @@ export interface CreateRideInput {
 export interface CreateFuelInput {
   amountRupees: number;
   pricePerLitre: number;
+  isFullTank: boolean;
   occurredAt: string;
   note?: string;
 }

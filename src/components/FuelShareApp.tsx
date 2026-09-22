@@ -185,6 +185,7 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           distanceKm: Number(form.get("distance")),
           amountRupees: Number(form.get("amount")),
           pricePerLitre: Number(form.get("price")),
+          isFullTank: form.get("isFullTank") === "on",
           recipientMemberId: String(form.get("recipient")),
           method: (form.get("method") as PaymentMethod | null) ?? undefined,
           reference: String(form.get("reference") ?? ""),
@@ -194,7 +195,7 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
       } else if (kind === "ride") {
         await addRide(data, { distanceKm: Number(form.get("distance")), occurredAt, note: String(form.get("note") ?? "") });
       } else if (kind === "fuel_purchase") {
-        await addFuel(data, { amountRupees: Number(form.get("amount")), pricePerLitre: Number(form.get("price")), occurredAt, note: String(form.get("note") ?? "") });
+        await addFuel(data, { amountRupees: Number(form.get("amount")), pricePerLitre: Number(form.get("price")), isFullTank: form.get("isFullTank") === "on", occurredAt, note: String(form.get("note") ?? "") });
       } else {
         await addPayment(data, {
           recipientMemberId: String(form.get("recipient")), amountRupees: Number(form.get("amount")),
@@ -228,6 +229,7 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
               <label>Amount paid (₹)<input name="amount" required autoFocus type="number" min="1" step="0.01" defaultValue={editing?.kind === "fuel_purchase" ? editing.amountPaise / 100 : ""} placeholder="500" /></label>
               <label>Price (₹/L)<input name="price" required type="number" min="1" step="0.01" defaultValue={editing?.kind === "fuel_purchase" ? editing.unitPricePaisePerLitre / 100 : ""} placeholder="102.50" /></label>
             </div>
+            <label className="check-field"><input name="isFullTank" type="checkbox" defaultChecked={editing?.kind === "fuel_purchase" && editing.isFullTank} /><span><strong>Filled the tank completely</strong><small>Uses the pump litres to correct the estimated fuel balance.</small></span></label>
           </>
         )}
         {kind === "payment" && (
@@ -298,6 +300,12 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
     .filter((event) => !event.deletedAt)
     .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)), [data]);
   const inviteUrl = typeof window === "undefined" ? "" : `${window.location.origin}/join/${data.group.inviteCode}`;
+  const latestCalibration = snapshot.calibrations.at(-1);
+  const calibrationByEventId = new Map(snapshot.calibrations.map((calibration) => [calibration.eventId, calibration]));
+
+  function signedLitres(millilitres: number): string {
+    return `${millilitres >= 0 ? "+" : "−"}${formatLitres(Math.abs(millilitres))}`;
+  }
 
   async function copyInvite() {
     await navigator.clipboard.writeText(inviteUrl);
@@ -306,10 +314,16 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
   }
 
   function eventSummary(event: LedgerEvent): { icon: React.ReactNode; title: string; detail: string; amount?: string } {
-    if (event.kind === "fuel_purchase") return {
-      icon: <Fuel />, title: `${memberName(data, event.payerMemberId)} refilled`,
-      detail: `${formatLitres(event.volumeMl)} at ${formatMoney(event.unitPricePaisePerLitre)}/L`, amount: formatMoney(event.amountPaise),
-    };
+    if (event.kind === "fuel_purchase") {
+      const calibration = calibrationByEventId.get(event.id);
+      const calibrationDetail = calibration
+        ? ` · full-tank calibration: ${formatLitres(calibration.estimatedBeforeMl)} estimated → ${formatLitres(calibration.actualBeforeMl)} actual (${signedLitres(calibration.adjustmentMl)})`
+        : "";
+      return {
+        icon: <Fuel />, title: `${memberName(data, event.payerMemberId)} refilled`,
+        detail: `${formatLitres(event.volumeMl)} at ${formatMoney(event.unitPricePaisePerLitre)}/L${calibrationDetail}`, amount: formatMoney(event.amountPaise),
+      };
+    }
     if (event.kind === "ride") return {
       icon: <Bike />, title: `${memberName(data, event.riderMemberId)} rode`,
       detail: `${formatLitres(event.consumedMl)} estimated use`, amount: formatDistance(event.distanceM),
@@ -324,7 +338,8 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
     const numberValue = (camel: string, snake: string): number => Number(previous[camel] ?? previous[snake] ?? 0);
     if (kind === "ride") return `${formatDistance(numberValue("distanceM", "distance_m"))} ride`;
     if (kind === "fuel_purchase") {
-      return `${formatMoney(numberValue("amountPaise", "amount_paise"))} refill at ${formatMoney(numberValue("unitPricePaisePerLitre", "unit_price_paise_per_litre"))}/L`;
+      const wasFullTank = previous.isFullTank === true || previous.is_full_tank === true;
+      return `${formatMoney(numberValue("amountPaise", "amount_paise"))} refill at ${formatMoney(numberValue("unitPricePaisePerLitre", "unit_price_paise_per_litre"))}/L${wasFullTank ? " · full-tank calibration" : ""}`;
     }
     return `${formatMoney(numberValue("amountPaise", "amount_paise"))} repayment`;
   }
@@ -357,6 +372,13 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
 
           {snapshot.issues.length > 0 && <ErrorMessage message={snapshot.issues[0].message} />}
 
+          {latestCalibration && (
+            <div className="calibration-note">
+              <Check />
+              <span>Before the last full refill, FuelShare estimated {formatLitres(latestCalibration.estimatedBeforeMl)} and the pump showed {formatLitres(latestCalibration.actualBeforeMl)}. Corrected by <strong>{signedLitres(latestCalibration.adjustmentMl)}</strong>.</span>
+            </div>
+          )}
+
           <section className="quick-actions" aria-label="Quick actions">
             <button className="action ride-action" onClick={() => setModal({ type: "ride" })}><span><Bike /></span><b>Log ride</b><small>Just enter kilometres</small></button>
             <button className="action fuel-action" onClick={() => setModal({ type: "fuel" })}><span><Fuel /></span><b>Add petrol</b><small>Amount and price/L</small></button>
@@ -385,7 +407,8 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
               {snapshot.fuelOwners.map((owner) => (
                 <div className="owner-row" key={owner.memberId}><span className="mini-avatar">{memberName(data, owner.memberId).slice(0, 1)}</span><div><strong>{memberName(data, owner.memberId)}</strong><small>{formatLitres(owner.remainingMl)} still in tank</small></div><b>{formatMoney(owner.remainingValuePaise)}</b></div>
               ))}
-              {snapshot.fuelOwners.length === 0 && <p className="muted">No petrol is recorded in the tank.</p>}
+              {snapshot.tank.unattributedMl > 0 && <div className="owner-row"><span className="mini-avatar">≈</span><div><strong>Calibration adjustment</strong><small>{formatLitres(snapshot.tank.unattributedMl)} was already accounted for</small></div><b>—</b></div>}
+              {snapshot.fuelOwners.length === 0 && snapshot.tank.unattributedMl === 0 && <p className="muted">No petrol is recorded in the tank.</p>}
             </div>
           </section>
         </>

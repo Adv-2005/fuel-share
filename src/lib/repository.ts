@@ -57,7 +57,7 @@ interface MemberRow {
 
 interface FuelRow {
   id: string; group_id: string; payer_member_id: string; created_by_user_id: string;
-  amount_paise: number; unit_price_paise_per_litre: number; volume_ml: number;
+  amount_paise: number; unit_price_paise_per_litre: number; volume_ml: number; is_full_tank: boolean;
   occurred_at: string; created_at: string; updated_at: string; deleted_at: string | null; note: string;
 }
 
@@ -116,7 +116,7 @@ function queueCloudEvent(event: LedgerEvent): void {
   savePendingActions(actions);
 }
 
-function cloudRecordFor(event: LedgerEvent): Record<string, string | number | null> {
+function cloudRecordFor(event: LedgerEvent): Record<string, string | number | boolean | null> {
   const base = {
     id: event.id,
     group_id: event.groupId,
@@ -130,6 +130,7 @@ function cloudRecordFor(event: LedgerEvent): Record<string, string | number | nu
   if (event.kind === "fuel_purchase") return {
     ...base, payer_member_id: event.payerMemberId, amount_paise: event.amountPaise,
     unit_price_paise_per_litre: event.unitPricePaisePerLitre, volume_ml: event.volumeMl,
+    is_full_tank: event.isFullTank,
   };
   if (event.kind === "ride") return {
     ...base, rider_member_id: event.riderMemberId, distance_m: event.distanceM,
@@ -226,6 +227,7 @@ function fuelFromRow(row: FuelRow): FuelPurchase {
     id: row.id, kind: "fuel_purchase", groupId: row.group_id, payerMemberId: row.payer_member_id,
     createdByUserId: row.created_by_user_id, amountPaise: row.amount_paise,
     unitPricePaisePerLitre: row.unit_price_paise_per_litre, volumeMl: row.volume_ml,
+    isFullTank: row.is_full_tank ?? false,
     occurredAt: row.occurred_at, createdAt: row.created_at, updatedAt: row.updated_at,
     deletedAt: row.deleted_at, note: row.note,
   };
@@ -389,7 +391,7 @@ export async function createGroup(input: CreateGroupInput): Promise<GroupData> {
   database.purchases.push({
     id: crypto.randomUUID(), kind: "fuel_purchase", groupId, payerMemberId: memberId, createdByUserId: userId,
     amountPaise: Math.round(input.initialAmountRupees * 100), unitPricePaisePerLitre: Math.round(input.initialPricePerLitre * 100),
-    volumeMl, occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "Initial known-tank refill",
+    volumeMl, isFullTank: false, occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "Initial known-tank refill",
   });
   saveLocalDatabase(database);
   rememberGroup(groupId);
@@ -469,7 +471,7 @@ export async function addFuel(data: GroupData, input: CreateFuelInput): Promise<
   const event: FuelPurchase = {
     id: crypto.randomUUID(), kind: "fuel_purchase", groupId: data.group.id, payerMemberId: data.currentMemberId,
     createdByUserId: data.currentUserId, amountPaise: Math.round(input.amountRupees * 100),
-    unitPricePaisePerLitre: Math.round(input.pricePerLitre * 100), volumeMl,
+    unitPricePaisePerLitre: Math.round(input.pricePerLitre * 100), volumeMl, isFullTank: input.isFullTank,
     occurredAt: input.occurredAt, note: input.note?.trim() ?? "", createdAt: now, updatedAt: now, deletedAt: null,
   };
   if (data.mode === "cloud") {
@@ -503,6 +505,7 @@ export async function addPayment(data: GroupData, input: CreatePaymentInput): Pr
 export interface EventUpdateInput {
   amountRupees?: number;
   pricePerLitre?: number;
+  isFullTank?: boolean;
   distanceKm?: number;
   recipientMemberId?: string;
   method?: PaymentMethod;
@@ -521,11 +524,11 @@ export async function updateEvent(data: GroupData, event: LedgerEvent, input: Ev
   if (event.createdByUserId !== data.currentUserId) throw new Error("You can only correct entries that you recorded.");
   if (data.mode === "cloud") {
     const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
-    let update: Record<string, string | number>;
+    let update: Record<string, string | number | boolean>;
     if (event.kind === "fuel_purchase") {
       const amount = input.amountRupees ?? event.amountPaise / 100;
       const price = input.pricePerLitre ?? event.unitPricePaisePerLitre / 100;
-      update = { amount_paise: Math.round(amount * 100), unit_price_paise_per_litre: Math.round(price * 100), volume_ml: litresFromMoney(amount, price), occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
+      update = { amount_paise: Math.round(amount * 100), unit_price_paise_per_litre: Math.round(price * 100), volume_ml: litresFromMoney(amount, price), is_full_tank: input.isFullTank ?? event.isFullTank, occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
     } else if (event.kind === "ride") {
       const distance = input.distanceKm ?? event.distanceM / 1000;
       update = { distance_m: Math.round(distance * 1000), consumed_ml: fuelForRide(distance, event.efficiencyMPerLitre / 1000), occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
@@ -548,7 +551,7 @@ export async function updateEvent(data: GroupData, event: LedgerEvent, input: Ev
   if (event.kind === "fuel_purchase") {
     const amount = input.amountRupees ?? event.amountPaise / 100;
     const price = input.pricePerLitre ?? event.unitPricePaisePerLitre / 100;
-    Object.assign(collection[index], { amountPaise: Math.round(amount * 100), unitPricePaisePerLitre: Math.round(price * 100), volumeMl: litresFromMoney(amount, price), occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
+    Object.assign(collection[index], { amountPaise: Math.round(amount * 100), unitPricePaisePerLitre: Math.round(price * 100), volumeMl: litresFromMoney(amount, price), isFullTank: input.isFullTank ?? event.isFullTank, occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
   } else if (event.kind === "ride") {
     const distance = input.distanceKm ?? event.distanceM / 1000;
     Object.assign(collection[index], { distanceM: Math.round(distance * 1000), consumedMl: fuelForRide(distance, event.efficiencyMPerLitre / 1000), occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
