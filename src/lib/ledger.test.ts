@@ -189,6 +189,26 @@ describe("opening tank balance", () => {
     expect(result.memberBalances.reduce((sum, balance) => sum + balance.balancePaise, 0)).toBe(0);
   });
 
+  it("carries ownership rounding across multiple ride slices", () => {
+    const equal = opening({
+      amountPaise: 2,
+      volumeMl: 2,
+      ownershipMode: "equal",
+      ownerShares: equalOwnershipShares(["alice", "bob"]),
+    });
+    const rides = [
+      ride({ id: "first-slice", riderMemberId: "cara", consumedMl: 1, distanceM: 45, occurredAt: "2026-01-02T10:00:00.000Z" }),
+      ride({ id: "second-slice", riderMemberId: "cara", consumedMl: 1, distanceM: 45, occurredAt: "2026-01-03T10:00:00.000Z" }),
+    ];
+
+    const result = calculateLedger(group, members, [], rides, [], [equal]);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance.balancePaise]));
+    expect(balances.get("alice")).toBe(1);
+    expect(balances.get("bob")).toBe(1);
+    expect(balances.get("cara")).toBe(-2);
+    expect(result.memberBalances.reduce((sum, balance) => sum + balance.balancePaise, 0)).toBe(0);
+  });
+
   it("ignores an equal owner's own portion", () => {
     const equal = opening({ ownershipMode: "equal", ownerShares: equalOwnershipShares(["alice", "bob"]) });
     const result = calculateLedger(group, members, [], [ride({ riderMemberId: "alice" })], [], [equal]);

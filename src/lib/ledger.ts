@@ -13,7 +13,11 @@ import type {
 } from "@/lib/types";
 
 interface FuelLot {
-  ownerShares: OpeningOwnerShare[];
+  ownerPositions: Array<{
+    memberId: string;
+    remainingMl: number;
+    remainingValuePaise: number;
+  }>;
   source: "owned" | "shared_opening" | "calibration";
   remainingMl: number;
   remainingValuePaise: number;
@@ -59,6 +63,51 @@ export function splitByOwnership(total: number, shares: OpeningOwnerShare[]): Ar
   const roundingOrder = [...parts].sort((a, b) => b.remainder - a.remainder || a.memberId.localeCompare(b.memberId));
   for (let index = 0; index < unallocated; index += 1) roundingOrder[index % roundingOrder.length].amount += 1;
   return parts.map(({ memberId, amount }) => ({ memberId, amount }));
+}
+
+function createFuelLot(
+  ownerShares: OpeningOwnerShare[],
+  source: FuelLot["source"],
+  volumeMl: number,
+  valuePaise: number,
+): FuelLot {
+  const volumes = new Map(splitByOwnership(volumeMl, ownerShares).map((part) => [part.memberId, part.amount]));
+  const values = new Map(splitByOwnership(valuePaise, ownerShares).map((part) => [part.memberId, part.amount]));
+  return {
+    ownerPositions: ownerShares.map((share) => ({
+      memberId: share.memberId,
+      remainingMl: volumes.get(share.memberId) ?? 0,
+      remainingValuePaise: values.get(share.memberId) ?? 0,
+    })),
+    source,
+    remainingMl: volumeMl,
+    remainingValuePaise: valuePaise,
+  };
+}
+
+function consumeOwnerPositions(
+  amount: number,
+  positions: FuelLot["ownerPositions"],
+  field: "remainingMl" | "remainingValuePaise",
+): Array<{ memberId: string; amount: number }> {
+  const available = positions.reduce((sum, position) => sum + position[field], 0);
+  if (amount <= 0 || available <= 0) return positions.map((position) => ({ memberId: position.memberId, amount: 0 }));
+
+  const consumed = Math.min(amount, available);
+  const parts = positions.map((position) => {
+    const exactNumerator = consumed * position[field];
+    return {
+      memberId: position.memberId,
+      amount: Math.floor(exactNumerator / available),
+      remainder: exactNumerator % available,
+      position,
+    };
+  });
+  const unallocated = consumed - parts.reduce((sum, part) => sum + part.amount, 0);
+  const roundingOrder = [...parts].sort((a, b) => b.remainder - a.remainder || a.memberId.localeCompare(b.memberId));
+  for (let index = 0; index < unallocated; index += 1) roundingOrder[index].amount += 1;
+  for (const part of parts) part.position[field] -= part.amount;
+  return parts.map(({ memberId, amount: allocated }) => ({ memberId, amount: allocated }));
 }
 
 export function equalOwnershipShares(memberIds: string[]): OpeningOwnerShare[] {
@@ -115,12 +164,12 @@ export function calculateLedger(
     if (event.type === "opening") {
       const opening = event.value;
       tankMl += opening.volumeMl;
-      lots.push({
-        ownerShares: opening.ownerShares,
-        source: opening.ownershipMode === "shared" ? "shared_opening" : "owned",
-        remainingMl: opening.volumeMl,
-        remainingValuePaise: opening.amountPaise,
-      });
+      lots.push(createFuelLot(
+        opening.ownerShares,
+        opening.ownershipMode === "shared" ? "shared_opening" : "owned",
+        opening.volumeMl,
+        opening.amountPaise,
+      ));
       if (tankMl > group.tankCapacityMl) issues.push({
         eventId: opening.id,
         code: "tank_overflow",
@@ -145,24 +194,26 @@ export function calculateLedger(
             const removedValuePaise = removedMl === lot.remainingMl
               ? lot.remainingValuePaise
               : Math.round((lot.remainingValuePaise * removedMl) / lot.remainingMl);
+            consumeOwnerPositions(removedMl, lot.ownerPositions, "remainingMl");
+            consumeOwnerPositions(removedValuePaise, lot.ownerPositions, "remainingValuePaise");
             lot.remainingMl -= removedMl;
             lot.remainingValuePaise -= removedValuePaise;
             correctionMl -= removedMl;
           }
         } else if (adjustmentMl > 0) {
-          lots.push({ ownerShares: [], source: "calibration", remainingMl: adjustmentMl, remainingValuePaise: 0 });
+          lots.push(createFuelLot([], "calibration", adjustmentMl, 0));
         }
 
         calibrations.push({ eventId: purchase.id, estimatedBeforeMl, actualBeforeMl, adjustmentMl });
         tankMl = actualBeforeMl;
       }
       tankMl += purchase.volumeMl;
-      lots.push({
-        ownerShares: [{ memberId: purchase.payerMemberId, shareBasisPoints: 10_000 }],
-        source: "owned",
-        remainingMl: purchase.volumeMl,
-        remainingValuePaise: purchase.amountPaise,
-      });
+      lots.push(createFuelLot(
+        [{ memberId: purchase.payerMemberId, shareBasisPoints: 10_000 }],
+        "owned",
+        purchase.volumeMl,
+        purchase.amountPaise,
+      ));
       if (tankMl > group.tankCapacityMl) issues.push({
         eventId: purchase.id,
         code: "tank_overflow",
@@ -189,11 +240,13 @@ export function calculateLedger(
       const consumedCost = consumedMl === lot.remainingMl
         ? lot.remainingValuePaise
         : Math.round((lot.remainingValuePaise * consumedMl) / lot.remainingMl);
+      consumeOwnerPositions(consumedMl, lot.ownerPositions, "remainingMl");
+      const ownerAllocations = consumeOwnerPositions(consumedCost, lot.ownerPositions, "remainingValuePaise");
       lot.remainingMl -= consumedMl;
       lot.remainingValuePaise -= consumedCost;
       requiredMl -= consumedMl;
 
-      for (const allocation of splitByOwnership(consumedCost, lot.ownerShares)) {
+      for (const allocation of ownerAllocations) {
         if (allocation.memberId === ride.riderMemberId) continue;
         const ownerBalance = balances.get(allocation.memberId);
         if (ownerBalance) ownerBalance.balancePaise += allocation.amount;
@@ -212,14 +265,12 @@ export function calculateLedger(
 
   const fuelOwnerMap = new Map<string, FuelOwnerPosition>();
   for (const lot of lots) {
-    if (lot.remainingMl <= 0 || lot.ownerShares.length === 0) continue;
-    const volumes = new Map(splitByOwnership(lot.remainingMl, lot.ownerShares).map((part) => [part.memberId, part.amount]));
-    const values = new Map(splitByOwnership(lot.remainingValuePaise, lot.ownerShares).map((part) => [part.memberId, part.amount]));
-    for (const share of lot.ownerShares) {
-      const current = fuelOwnerMap.get(share.memberId) ?? { memberId: share.memberId, remainingMl: 0, remainingValuePaise: 0 };
-      current.remainingMl += volumes.get(share.memberId) ?? 0;
-      current.remainingValuePaise += values.get(share.memberId) ?? 0;
-      fuelOwnerMap.set(share.memberId, current);
+    if (lot.remainingMl <= 0 || lot.ownerPositions.length === 0) continue;
+    for (const position of lot.ownerPositions) {
+      const current = fuelOwnerMap.get(position.memberId) ?? { memberId: position.memberId, remainingMl: 0, remainingValuePaise: 0 };
+      current.remainingMl += position.remainingMl;
+      current.remainingValuePaise += position.remainingValuePaise;
+      fuelOwnerMap.set(position.memberId, current);
     }
   }
 
