@@ -1,6 +1,8 @@
 export type MemberRole = "admin" | "member";
 export type PaymentMethod = "upi" | "cash";
-export type EventKind = "fuel_purchase" | "ride" | "payment";
+export type EventKind = "opening_balance" | "fuel_purchase" | "ride" | "payment";
+export type SetupStatus = "pending" | "complete";
+export type OpeningOwnershipMode = "empty" | "single" | "equal" | "shared";
 
 export interface Group {
   id: string;
@@ -10,6 +12,7 @@ export interface Group {
   tankCapacityMl: number;
   mileageMPerLitre: number;
   adminUserId: string;
+  setupStatus: SetupStatus;
   createdAt: string;
 }
 
@@ -42,6 +45,20 @@ export interface FuelPurchase extends BaseEvent {
   isFullTank: boolean;
 }
 
+export interface OpeningOwnerShare {
+  memberId: string;
+  shareBasisPoints: number;
+}
+
+export interface OpeningBalance extends BaseEvent {
+  kind: "opening_balance";
+  amountPaise: number;
+  unitPricePaisePerLitre: number;
+  volumeMl: number;
+  ownershipMode: OpeningOwnershipMode;
+  ownerShares: OpeningOwnerShare[];
+}
+
 export interface Ride extends BaseEvent {
   kind: "ride";
   riderMemberId: string;
@@ -59,7 +76,7 @@ export interface SettlementPayment extends BaseEvent {
   reference: string;
 }
 
-export type LedgerEvent = FuelPurchase | Ride | SettlementPayment;
+export type LedgerEvent = OpeningBalance | FuelPurchase | Ride | SettlementPayment;
 
 export interface EventRevision {
   id: string;
@@ -108,6 +125,8 @@ export interface DashboardSnapshot {
     remainingMl: number;
     remainingValuePaise: number;
     unattributedMl: number;
+    sharedOpeningMl: number;
+    sharedOpeningValuePaise: number;
     capacityMl: number;
     percent: number;
   };
@@ -122,6 +141,7 @@ export interface GroupData {
   group: Group;
   members: Member[];
   purchases: FuelPurchase[];
+  openingBalances: OpeningBalance[];
   rides: Ride[];
   payments: SettlementPayment[];
   revisions: EventRevision[];
@@ -137,8 +157,22 @@ export interface CreateGroupInput {
   displayName: string;
   tankCapacityLitres: number;
   mileageKmPerLitre: number;
-  initialAmountRupees: number;
-  initialPricePerLitre: number;
+  opening:
+    | { state: "empty" }
+    | { state: "deferred" }
+    | {
+        state: "existing";
+        volumeLitres: number;
+        pricePerLitre: number;
+        ownershipMode: "single" | "shared";
+      };
+}
+
+export interface SaveOpeningBalanceInput {
+  volumeLitres: number;
+  pricePerLitre: number;
+  ownershipMode: OpeningOwnershipMode;
+  ownerMemberIds: string[];
 }
 
 export interface CreateRideInput {

@@ -11,6 +11,8 @@ FuelShare is a mobile-first shared scooter-petrol ledger for a trusted group of 
 - A member consuming fuel they purchased creates no debt. Other consumption credits the batch owner and debits the rider.
 - UPI and cash repayments adjust member balances. The app nets those balances into minimal suggested transfers.
 - Money is stored in paise, volume in millilitres, and distance in metres.
+- An opening tank event precedes normal refills and can be empty, single-owner, equally owned, or non-reimbursable shared fuel.
+- Multi-owner lots credit every owner proportionally; deterministic integer rounding preserves every paise and keeps balances net-zero.
 - Backdated additions or corrections are rejected when they would make the calculated tank negative or exceed capacity.
 - Corrections retain their previous values in a visible revision history.
 
@@ -20,7 +22,7 @@ FuelShare is a mobile-first shared scooter-petrol ledger for a trusted group of 
 - Invite-link membership with an anonymous per-device identity and display name.
 - Supabase Postgres, row-level security, anonymous authentication, and realtime refresh.
 - Local browser mode when Supabase is not configured.
-- Known-refill onboarding, quick ride/refill forms, settlement recording, dashboard, activity, member balances, and scooter settings.
+- Two-step opening-tank onboarding, deferred setup after members join, quick ride/refill forms, settlement recording, dashboard, activity, member balances, and scooter settings.
 - One group and one scooter per active device in the initial UI.
 
 ## Deferred
