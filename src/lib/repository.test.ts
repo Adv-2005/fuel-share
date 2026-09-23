@@ -1,9 +1,66 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { addFuel, addRide, createGroup, loadCurrentGroup, saveOpeningBalance, selectAccessibleGroupId, validateOpeningBalanceInput } from "@/lib/repository";
+import {
+  addFuel,
+  addRide,
+  createGroup,
+  createRidePreset,
+  dashboardRidePresets,
+  deleteRidePreset,
+  loadCurrentGroup,
+  logRideFromPreset,
+  moveRidePreset,
+  saveOpeningBalance,
+  selectAccessibleGroupId,
+  updateRidePreset,
+  validateOpeningBalanceInput,
+  voidRide,
+} from "@/lib/repository";
+import { getSupabase } from "@/lib/supabase";
+import type { FuelPurchase, GroupData, Member, Ride, RidePreset } from "@/lib/types";
+
+const now = "2026-01-01T00:00:00.000Z";
+
+function member(id: string, userId: string): Member {
+  return { id, groupId: "group", userId, displayName: id, role: id === "alice" ? "admin" : "member", createdAt: now };
+}
+
+function preset(overrides: Partial<RidePreset> = {}): RidePreset {
+  return {
+    id: "preset-1", groupId: "group", memberId: "alice", label: "College", distanceM: 8_000,
+    isPinned: true, displayOrder: 0, lastUsedAt: null, usageCount: 0, createdAt: now, updatedAt: now,
+    ...overrides,
+  };
+}
+
+function groupData(overrides: Partial<GroupData> = {}): GroupData {
+  return {
+    group: { id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000, mileageMPerLitre: 40_000, adminUserId: "alice-user", setupStatus: "complete", createdAt: now },
+    members: [member("alice", "alice-user"), member("bob", "bob-user")], purchases: [], openingBalances: [], rides: [], payments: [], presets: [], revisions: [],
+    currentUserId: "alice-user", currentMemberId: "alice", pendingEventIds: [], mode: "local", ...overrides,
+  };
+}
+
+function seedLocal(data: GroupData): void {
+  const purchase: FuelPurchase = {
+    id: "fuel", kind: "fuel_purchase", groupId: "group", payerMemberId: "alice", createdByUserId: "alice-user",
+    amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000, isFullTank: false,
+    occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "",
+  };
+  localStorage.setItem("fuelshare_user_id", data.currentUserId);
+  localStorage.setItem("fuelshare_active_group", data.group.id);
+  localStorage.setItem("fuelshare_database_v1", JSON.stringify({
+    groups: [data.group], members: data.members, purchases: [purchase], openingBalances: data.openingBalances, rides: data.rides,
+    payments: data.payments, presets: data.presets, revisions: data.revisions,
+  }));
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
 
 vi.mock("@/lib/supabase", () => ({ isCloudConfigured: () => false, getSupabase: vi.fn() }));
-
-beforeEach(() => window.localStorage.clear());
 
 describe("selectAccessibleGroupId", () => {
   it("keeps the preferred group when the cloud user is a member", () => {
@@ -16,6 +73,194 @@ describe("selectAccessibleGroupId", () => {
 
   it("returns no group when the cloud user has no memberships", () => {
     expect(selectAccessibleGroupId("old-local-group", [])).toBeNull();
+  });
+});
+
+describe("ride presets", () => {
+  it("creates a personal preset in metres", async () => {
+    const data = groupData();
+    seedLocal(data);
+
+    const created = await createRidePreset(data, { label: " College ", distanceKm: 8, isPinned: true });
+    const loaded = await loadCurrentGroup("group");
+
+    expect(created).toMatchObject({ label: "College", distanceM: 8_000, memberId: "alice", isPinned: true });
+    expect(loaded?.presets).toEqual([created]);
+  });
+
+  it("rejects case-insensitive duplicate labels for one member", async () => {
+    const data = groupData();
+    seedLocal(data);
+    await createRidePreset(data, { label: "College", distanceKm: 8, isPinned: true });
+
+    await expect(createRidePreset(data, { label: " college ", distanceKm: 9, isPinned: false }))
+      .rejects.toThrow("already have");
+  });
+
+  it("permits the same label for different members", async () => {
+    const aliceData = groupData();
+    seedLocal(aliceData);
+    await createRidePreset(aliceData, { label: "Gym", distanceKm: 2, isPinned: true });
+    const bobData = groupData({ currentUserId: "bob-user", currentMemberId: "bob" });
+
+    await expect(createRidePreset(bobData, { label: "gym", distanceKm: 3, isPinned: true })).resolves.toMatchObject({ memberId: "bob" });
+  });
+
+  it("logs through addRide with the preset distance, mileage, id, and label snapshot", async () => {
+    const college = preset();
+    const data = groupData({ presets: [college] });
+    seedLocal(data);
+
+    const { ride } = await logRideFromPreset(data, college);
+
+    expect(ride).toMatchObject({ distanceM: 8_000, efficiencyMPerLitre: 40_000, consumedMl: 200, presetId: college.id, presetLabel: "College" });
+    const loaded = await loadCurrentGroup("group");
+    expect(loaded?.presets[0]).toMatchObject({ usageCount: 1, lastUsedAt: expect.any(String) });
+  });
+
+  it("soft deletes an undone ride and retains its prior state as a revision", async () => {
+    const college = preset();
+    const data = groupData({ presets: [college] });
+    seedLocal(data);
+    const { ride } = await logRideFromPreset(data, college);
+
+    await voidRide(data, ride);
+    const loaded = await loadCurrentGroup("group");
+
+    expect(loaded?.rides[0].deletedAt).toEqual(expect.any(String));
+    expect(loaded?.revisions[0]).toMatchObject({ entityType: "ride", entityId: ride.id, previousData: expect.objectContaining({ deletedAt: null }) });
+  });
+
+  it("deletes a preset without changing the earlier ride label snapshot", async () => {
+    const college = preset();
+    const data = groupData({ presets: [college] });
+    seedLocal(data);
+    await logRideFromPreset(data, college);
+
+    await deleteRidePreset(data, college);
+    const loaded = await loadCurrentGroup("group");
+
+    expect(loaded?.presets).toEqual([]);
+    expect(loaded?.rides[0]).toMatchObject({ presetId: null, presetLabel: "College", distanceM: 8_000 });
+  });
+
+  it("edits a preset without changing earlier ride snapshots", async () => {
+    const college = preset();
+    const data = groupData({ presets: [college] });
+    seedLocal(data);
+    await logRideFromPreset(data, college);
+
+    await updateRidePreset(data, college, { label: "Campus", distanceKm: 9, isPinned: false });
+    const loaded = await loadCurrentGroup("group");
+
+    expect(loaded?.presets[0]).toMatchObject({ label: "Campus", distanceM: 9_000, isPinned: false });
+    expect(loaded?.rides[0]).toMatchObject({ presetLabel: "College", distanceM: 8_000 });
+  });
+
+  it("returns only the first four pinned presets in member order", () => {
+    const presets = [
+      preset({ id: "5", label: "Five", displayOrder: 5 }), preset({ id: "2", label: "Two", displayOrder: 2 }),
+      preset({ id: "1", label: "One", displayOrder: 1 }), preset({ id: "4", label: "Four", displayOrder: 4 }),
+      preset({ id: "3", label: "Three", displayOrder: 3 }), preset({ id: "hidden", label: "Hidden", displayOrder: 0, isPinned: false }),
+    ];
+    expect(dashboardRidePresets(presets).map((entry) => entry.label)).toEqual(["One", "Two", "Three", "Four"]);
+  });
+
+  it("reorders cloud presets with one atomic RPC", async () => {
+    const college = preset({ id: "preset-college", displayOrder: 0 });
+    const market = preset({ id: "preset-market", label: "Market", displayOrder: 1 });
+    const rpc = vi.fn().mockResolvedValue({ error: null });
+    vi.mocked(getSupabase).mockReturnValue({ rpc } as unknown as ReturnType<typeof getSupabase>);
+
+    await moveRidePreset(groupData({ mode: "cloud", presets: [college, market] }), market, "up");
+
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(rpc).toHaveBeenCalledWith("swap_ride_preset_order", {
+      p_preset_id: market.id,
+      p_target_id: college.id,
+    });
+  });
+
+  it("rejects attempts to alter another member's preset", async () => {
+    const data = groupData({ presets: [preset({ memberId: "bob" })] });
+    seedLocal(data);
+    await expect(updateRidePreset(data, data.presets[0], { label: "Mine", distanceKm: 2, isPinned: true }))
+      .rejects.toThrow("your own");
+  });
+
+  it("queues an offline quick ride in the existing pending-event queue", async () => {
+    vi.spyOn(window.navigator, "onLine", "get").mockReturnValue(false);
+    const college = preset();
+    const data = groupData({ mode: "cloud", presets: [college] });
+
+    const result = await logRideFromPreset(data, college);
+    const pending = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{ operation: string; event: { id: string; presetLabel: string } }>;
+
+    expect(result.pendingSync).toBe(true);
+    expect(pending).toEqual([expect.objectContaining({ operation: "insert", event: expect.objectContaining({ id: result.ride.id, presetLabel: "College" }) })]);
+
+    await voidRide(data, result.ride);
+    const afterUndo = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{
+      operation: string;
+      event: { id: string; groupId: string; kind: string; presetId?: string };
+      patch?: { deletedAt: string | null; updatedAt: string };
+    }>;
+    expect(afterUndo).toHaveLength(2);
+    expect(afterUndo[1]).toEqual({
+      operation: "update",
+      event: { id: result.ride.id, groupId: "group", kind: "ride" },
+      patch: { deletedAt: expect.any(String), updatedAt: expect.any(String) },
+    });
+    expect(afterUndo[1].event).not.toHaveProperty("presetId");
+  });
+
+  it("sends only soft-delete fields when undoing a cloud ride", async () => {
+    const update = vi.fn();
+    const eq = vi.fn().mockResolvedValue({ error: null });
+    update.mockReturnValue({ eq });
+    const from = vi.fn().mockReturnValue({ update });
+    vi.mocked(getSupabase).mockReturnValue({ from } as unknown as ReturnType<typeof getSupabase>);
+    const ride: Ride = {
+      id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "alice", createdByUserId: "alice-user",
+      distanceM: 8_000, efficiencyMPerLitre: 40_000, consumedMl: 200, presetId: "deleted-preset",
+      presetLabel: "College", occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "stale note",
+    };
+
+    await voidRide(groupData({ mode: "cloud", rides: [ride] }), ride);
+
+    expect(from).toHaveBeenCalledWith("rides");
+    expect(update).toHaveBeenCalledWith({
+      deleted_at: expect.any(String),
+      updated_at: expect.any(String),
+    });
+    expect(update.mock.calls[0][0]).not.toHaveProperty("preset_id");
+    expect(update.mock.calls[0][0]).not.toHaveProperty("note");
+    expect(eq).toHaveBeenCalledWith("id", ride.id);
+  });
+
+  it("defines member-private CRUD policies in the additive migration", () => {
+    const migration = readFileSync("supabase/migrations/004_ride_presets.sql", "utf8");
+    expect(migration).toContain("ride_presets_select_own");
+    expect(migration).toContain("ride_presets_insert_own");
+    expect(migration).toContain("ride_presets_update_own");
+    expect(migration).toContain("ride_presets_delete_own");
+    expect(migration.match(/public\.is_own_member\(member_id, group_id\)/g)).toHaveLength(5);
+  });
+
+  it("defines an authenticated, RLS-bound transaction for preset ordering", () => {
+    const migration = readFileSync("supabase/migrations/005_atomic_ride_preset_order.sql", "utf8");
+    expect(migration).toContain("security invoker");
+    expect(migration).toContain("for update");
+    expect(migration).toContain("update public.ride_presets");
+    expect(migration).toContain("grant execute on function public.swap_ride_preset_order(uuid, uuid) to authenticated");
+  });
+
+  it("preserves ride label snapshots and safely audits every ledger table", () => {
+    const migration = readFileSync("supabase/migrations/006_preserve_ride_preset_snapshots.sql", "utf8");
+    expect(migration).toContain("new.preset_label := old.preset_label");
+    expect(migration).toContain("A ride preset cannot be changed after a ride is logged.");
+    expect(migration).toContain("update of preset_id, preset_label");
+    expect(migration).toMatch(/if tg_table_name = 'rides' then\s+if old\.preset_id/s);
   });
 });
 
