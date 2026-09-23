@@ -40,12 +40,36 @@ interface LocalDatabase {
   presets: RidePreset[];
 }
 
-interface PendingCloudAction {
-  event: QueueableEvent;
-  operation?: "insert" | "update";
+type QueueableEvent = Exclude<LedgerEvent, OpeningBalance>;
+
+interface CloudEventReference {
+  id: string;
+  groupId: string;
+  kind: QueueableEvent["kind"];
 }
 
-type QueueableEvent = Exclude<LedgerEvent, OpeningBalance>;
+interface CloudEventPatch {
+  deletedAt: string | null;
+  updatedAt: string;
+}
+
+interface PendingCloudInsertAction {
+  event: QueueableEvent;
+  operation?: "insert";
+}
+
+interface PendingCloudUpdateAction {
+  event: CloudEventReference;
+  operation: "update";
+  patch: CloudEventPatch;
+}
+
+type PendingCloudAction = PendingCloudInsertAction | PendingCloudUpdateAction;
+
+interface LegacyPendingCloudUpdateAction {
+  event: QueueableEvent;
+  operation: "update";
+}
 
 interface GroupRow {
   id: string;
@@ -134,7 +158,15 @@ function loadPendingActions(): PendingCloudAction[] {
   const raw = window.localStorage.getItem(PENDING_ACTIONS_KEY);
   if (!raw) return [];
   try {
-    return JSON.parse(raw) as PendingCloudAction[];
+    const stored = JSON.parse(raw) as Array<PendingCloudAction | LegacyPendingCloudUpdateAction>;
+    return stored.map((action) => {
+      if (action.operation !== "update" || "patch" in action) return action;
+      return {
+        event: { id: action.event.id, groupId: action.event.groupId, kind: action.event.kind },
+        operation: "update",
+        patch: { deletedAt: action.event.deletedAt, updatedAt: action.event.updatedAt },
+      };
+    });
   } catch {
     return [];
   }
@@ -150,11 +182,12 @@ function queueCloudEvent(event: QueueableEvent): void {
   savePendingActions(actions);
 }
 
-function queueCloudUpdate(event: QueueableEvent): void {
+function queueCloudUpdate(event: CloudEventReference, patch: CloudEventPatch): void {
   const actions = loadPendingActions();
-  const existing = actions.find((action) => action.event.id === event.id && action.operation === "update");
-  if (existing) existing.event = event;
-  else actions.push({ event, operation: "update" });
+  const existing = actions.find((action): action is PendingCloudUpdateAction =>
+    action.event.id === event.id && action.operation === "update");
+  if (existing) existing.patch = { ...existing.patch, ...patch };
+  else actions.push({ event, operation: "update", patch });
   savePendingActions(actions);
 }
 
@@ -191,9 +224,12 @@ async function insertCloudEvent(event: QueueableEvent): Promise<{ code?: string;
   return error ? { code: error.code, message: error.message } : null;
 }
 
-async function updateCloudEvent(event: QueueableEvent): Promise<{ code?: string; message?: string } | null> {
+async function updateCloudEvent(event: CloudEventReference, patch: CloudEventPatch): Promise<{ code?: string; message?: string } | null> {
   const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
-  const { error } = await getSupabase().from(table).update(cloudRecordFor(event)).eq("id", event.id);
+  const { error } = await getSupabase().from(table).update({
+    deleted_at: patch.deletedAt,
+    updated_at: patch.updatedAt,
+  }).eq("id", event.id);
   return error ? { code: error.code, message: error.message } : null;
 }
 
@@ -224,9 +260,9 @@ async function flushPendingActions(groupId: string): Promise<void> {
       remaining.push(action);
       continue;
     }
-    const error = (action.operation ?? "insert") === "insert"
-      ? await insertCloudEvent(action.event)
-      : await updateCloudEvent(action.event);
+    const error = action.operation === "update"
+      ? await updateCloudEvent(action.event, action.patch)
+      : await insertCloudEvent(action.event);
     if (error && error.code !== "23505") remaining.push(action);
     if (error && isConnectivityError(error.message)) {
       remaining.push(...actions.slice(actions.indexOf(action) + 1));
@@ -411,7 +447,9 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
   for (const action of pending) {
     const collection: LedgerEvent[] = action.event.kind === "fuel_purchase" ? purchases : action.event.kind === "ride" ? rides : payments;
     const index = collection.findIndex((entry) => entry.id === action.event.id);
-    if (index >= 0) collection[index] = action.event;
+    if (action.operation === "update") {
+      if (index >= 0) collection[index] = { ...collection[index], ...action.patch };
+    } else if (index >= 0) collection[index] = action.event;
     else collection.push(action.event);
   }
   return {
@@ -757,11 +795,11 @@ export async function moveRidePreset(data: GroupData, preset: RidePreset, direct
   const target = ordered[targetIndex];
   if (index < 0 || !target) return;
   if (data.mode === "cloud") {
-    const supabase = getSupabase();
-    const first = await supabase.from("ride_presets").update({ display_order: target.displayOrder }).eq("id", preset.id);
-    if (first.error) throw new Error(first.error.message);
-    const second = await supabase.from("ride_presets").update({ display_order: preset.displayOrder }).eq("id", target.id);
-    if (second.error) throw new Error(second.error.message);
+    const { error } = await getSupabase().rpc("swap_ride_preset_order", {
+      p_preset_id: preset.id,
+      p_target_id: target.id,
+    });
+    if (error) throw new Error(error.message);
     return;
   }
   const database = loadLocalDatabase();
@@ -816,15 +854,17 @@ export async function voidRide(data: GroupData, ride: Ride): Promise<void> {
   const now = new Date().toISOString();
   const deletedRide: Ride = { ...ride, deletedAt: now, updatedAt: now };
   if (data.mode === "cloud") {
+    const event = { id: ride.id, groupId: ride.groupId, kind: ride.kind };
+    const patch = { deletedAt: now, updatedAt: now };
     const hasPendingInsert = loadPendingActions().some((action) => action.event.id === ride.id && (action.operation ?? "insert") === "insert");
     if (!navigator.onLine || hasPendingInsert) {
-      queueCloudUpdate(deletedRide);
+      queueCloudUpdate(event, patch);
       return;
     }
-    const error = await updateCloudEvent(deletedRide);
+    const error = await updateCloudEvent(event, patch);
     if (!error) return;
     if (isConnectivityError(error.message)) {
-      queueCloudUpdate(deletedRide);
+      queueCloudUpdate(event, patch);
       return;
     }
     throw new Error(error.message ?? "Could not undo this ride.");

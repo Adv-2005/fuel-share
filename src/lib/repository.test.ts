@@ -9,13 +9,15 @@ import {
   deleteRidePreset,
   loadCurrentGroup,
   logRideFromPreset,
+  moveRidePreset,
   saveOpeningBalance,
   selectAccessibleGroupId,
   updateRidePreset,
   validateOpeningBalanceInput,
   voidRide,
 } from "@/lib/repository";
-import type { FuelPurchase, GroupData, Member, RidePreset } from "@/lib/types";
+import { getSupabase } from "@/lib/supabase";
+import type { FuelPurchase, GroupData, Member, Ride, RidePreset } from "@/lib/types";
 
 const now = "2026-01-01T00:00:00.000Z";
 
@@ -164,6 +166,21 @@ describe("ride presets", () => {
     expect(dashboardRidePresets(presets).map((entry) => entry.label)).toEqual(["One", "Two", "Three", "Four"]);
   });
 
+  it("reorders cloud presets with one atomic RPC", async () => {
+    const college = preset({ id: "preset-college", displayOrder: 0 });
+    const market = preset({ id: "preset-market", label: "Market", displayOrder: 1 });
+    const rpc = vi.fn().mockResolvedValue({ error: null });
+    vi.mocked(getSupabase).mockReturnValue({ rpc } as unknown as ReturnType<typeof getSupabase>);
+
+    await moveRidePreset(groupData({ mode: "cloud", presets: [college, market] }), market, "up");
+
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(rpc).toHaveBeenCalledWith("swap_ride_preset_order", {
+      p_preset_id: market.id,
+      p_target_id: college.id,
+    });
+  });
+
   it("rejects attempts to alter another member's preset", async () => {
     const data = groupData({ presets: [preset({ memberId: "bob" })] });
     seedLocal(data);
@@ -183,9 +200,42 @@ describe("ride presets", () => {
     expect(pending).toEqual([expect.objectContaining({ operation: "insert", event: expect.objectContaining({ id: result.ride.id, presetLabel: "College" }) })]);
 
     await voidRide(data, result.ride);
-    const afterUndo = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{ operation: string; event: { deletedAt: string | null } }>;
+    const afterUndo = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{
+      operation: string;
+      event: { id: string; groupId: string; kind: string; presetId?: string };
+      patch?: { deletedAt: string | null; updatedAt: string };
+    }>;
     expect(afterUndo).toHaveLength(2);
-    expect(afterUndo[1]).toMatchObject({ operation: "update", event: { deletedAt: expect.any(String) } });
+    expect(afterUndo[1]).toEqual({
+      operation: "update",
+      event: { id: result.ride.id, groupId: "group", kind: "ride" },
+      patch: { deletedAt: expect.any(String), updatedAt: expect.any(String) },
+    });
+    expect(afterUndo[1].event).not.toHaveProperty("presetId");
+  });
+
+  it("sends only soft-delete fields when undoing a cloud ride", async () => {
+    const update = vi.fn();
+    const eq = vi.fn().mockResolvedValue({ error: null });
+    update.mockReturnValue({ eq });
+    const from = vi.fn().mockReturnValue({ update });
+    vi.mocked(getSupabase).mockReturnValue({ from } as unknown as ReturnType<typeof getSupabase>);
+    const ride: Ride = {
+      id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "alice", createdByUserId: "alice-user",
+      distanceM: 8_000, efficiencyMPerLitre: 40_000, consumedMl: 200, presetId: "deleted-preset",
+      presetLabel: "College", occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "stale note",
+    };
+
+    await voidRide(groupData({ mode: "cloud", rides: [ride] }), ride);
+
+    expect(from).toHaveBeenCalledWith("rides");
+    expect(update).toHaveBeenCalledWith({
+      deleted_at: expect.any(String),
+      updated_at: expect.any(String),
+    });
+    expect(update.mock.calls[0][0]).not.toHaveProperty("preset_id");
+    expect(update.mock.calls[0][0]).not.toHaveProperty("note");
+    expect(eq).toHaveBeenCalledWith("id", ride.id);
   });
 
   it("defines member-private CRUD policies in the additive migration", () => {
@@ -195,6 +245,14 @@ describe("ride presets", () => {
     expect(migration).toContain("ride_presets_update_own");
     expect(migration).toContain("ride_presets_delete_own");
     expect(migration.match(/public\.is_own_member\(member_id, group_id\)/g)).toHaveLength(5);
+  });
+
+  it("defines an authenticated, RLS-bound transaction for preset ordering", () => {
+    const migration = readFileSync("supabase/migrations/005_atomic_ride_preset_order.sql", "utf8");
+    expect(migration).toContain("security invoker");
+    expect(migration).toContain("for update");
+    expect(migration).toContain("update public.ride_presets");
+    expect(migration).toContain("grant execute on function public.swap_ride_preset_order(uuid, uuid) to authenticated");
   });
 });
 
