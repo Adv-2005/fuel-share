@@ -254,6 +254,14 @@ describe("ride presets", () => {
     expect(migration).toContain("update public.ride_presets");
     expect(migration).toContain("grant execute on function public.swap_ride_preset_order(uuid, uuid) to authenticated");
   });
+
+  it("preserves ride label snapshots and safely audits every ledger table", () => {
+    const migration = readFileSync("supabase/migrations/006_preserve_ride_preset_snapshots.sql", "utf8");
+    expect(migration).toContain("new.preset_label := old.preset_label");
+    expect(migration).toContain("A ride preset cannot be changed after a ride is logged.");
+    expect(migration).toContain("update of preset_id, preset_label");
+    expect(migration).toMatch(/if tg_table_name = 'rides' then\s+if old\.preset_id/s);
+  });
 });
 
 describe("opening balance validation", () => {
