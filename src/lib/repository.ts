@@ -1,4 +1,4 @@
-import { calculateLedger, fuelForRide, litresFromMoney } from "@/lib/ledger";
+import { calculateLedger, equalOwnershipShares, fuelForRide, litresFromMoney } from "@/lib/ledger";
 import { getSupabase, isCloudConfigured } from "@/lib/supabase";
 import type {
   CreateFuelInput,
@@ -12,10 +12,13 @@ import type {
   GroupData,
   LedgerEvent,
   Member,
+  OpeningBalance,
+  OpeningOwnershipMode,
   PaymentMethod,
   Ride,
   RidePreset,
   RideSaveResult,
+  SaveOpeningBalanceInput,
   SettlementPayment,
   CreateRidePresetInput,
   UpdateRidePresetInput,
@@ -30,6 +33,7 @@ interface LocalDatabase {
   groups: Group[];
   members: Member[];
   purchases: FuelPurchase[];
+  openingBalances: OpeningBalance[];
   rides: Ride[];
   payments: SettlementPayment[];
   revisions: EventRevision[];
@@ -37,9 +41,11 @@ interface LocalDatabase {
 }
 
 interface PendingCloudAction {
-  event: LedgerEvent;
+  event: QueueableEvent;
   operation?: "insert" | "update";
 }
+
+type QueueableEvent = Exclude<LedgerEvent, OpeningBalance>;
 
 interface GroupRow {
   id: string;
@@ -49,6 +55,7 @@ interface GroupRow {
   tank_capacity_ml: number;
   mileage_m_per_litre: number;
   admin_user_id: string;
+  setup_status?: "pending" | "complete";
   created_at: string;
 }
 
@@ -65,6 +72,16 @@ interface FuelRow {
   id: string; group_id: string; payer_member_id: string; created_by_user_id: string;
   amount_paise: number; unit_price_paise_per_litre: number; volume_ml: number; is_full_tank: boolean;
   occurred_at: string; created_at: string; updated_at: string; deleted_at: string | null; note: string;
+}
+
+interface OpeningRow {
+  id: string; group_id: string; created_by_user_id: string; amount_paise: number;
+  unit_price_paise_per_litre: number; volume_ml: number; ownership_mode: OpeningOwnershipMode;
+  occurred_at: string; created_at: string; updated_at: string; deleted_at: string | null; note: string;
+}
+
+interface OpeningOwnerRow {
+  opening_balance_id: string; member_id: string; share_basis_points: number;
 }
 
 interface RideRow {
@@ -92,7 +109,7 @@ interface RevisionRow {
 }
 
 function emptyDatabase(): LocalDatabase {
-  return { groups: [], members: [], purchases: [], rides: [], payments: [], revisions: [], presets: [] };
+  return { groups: [], members: [], purchases: [], openingBalances: [], rides: [], payments: [], revisions: [], presets: [] };
 }
 
 function loadLocalDatabase(): LocalDatabase {
@@ -100,7 +117,10 @@ function loadLocalDatabase(): LocalDatabase {
   if (!raw) return emptyDatabase();
   try {
     const parsed = JSON.parse(raw) as LocalDatabase;
-    return { ...parsed, presets: parsed.presets ?? [] };
+    parsed.openingBalances ??= [];
+    parsed.presets ??= [];
+    parsed.groups = parsed.groups.map((group) => ({ ...group, setupStatus: group.setupStatus ?? "complete" }));
+    return parsed;
   } catch {
     return emptyDatabase();
   }
@@ -124,13 +144,13 @@ function savePendingActions(actions: PendingCloudAction[]): void {
   window.localStorage.setItem(PENDING_ACTIONS_KEY, JSON.stringify(actions));
 }
 
-function queueCloudEvent(event: LedgerEvent): void {
+function queueCloudEvent(event: QueueableEvent): void {
   const actions = loadPendingActions();
   if (!actions.some((action) => action.event.id === event.id && (action.operation ?? "insert") === "insert")) actions.push({ event, operation: "insert" });
   savePendingActions(actions);
 }
 
-function queueCloudUpdate(event: LedgerEvent): void {
+function queueCloudUpdate(event: QueueableEvent): void {
   const actions = loadPendingActions();
   const existing = actions.find((action) => action.event.id === event.id && action.operation === "update");
   if (existing) existing.event = event;
@@ -138,7 +158,7 @@ function queueCloudUpdate(event: LedgerEvent): void {
   savePendingActions(actions);
 }
 
-function cloudRecordFor(event: LedgerEvent): Record<string, string | number | boolean | null> {
+function cloudRecordFor(event: QueueableEvent): Record<string, string | number | boolean | null> {
   const base = {
     id: event.id,
     group_id: event.groupId,
@@ -165,13 +185,13 @@ function cloudRecordFor(event: LedgerEvent): Record<string, string | number | bo
   };
 }
 
-async function insertCloudEvent(event: LedgerEvent): Promise<{ code?: string; message?: string } | null> {
+async function insertCloudEvent(event: QueueableEvent): Promise<{ code?: string; message?: string } | null> {
   const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
   const { error } = await getSupabase().from(table).insert(cloudRecordFor(event));
   return error ? { code: error.code, message: error.message } : null;
 }
 
-async function updateCloudEvent(event: LedgerEvent): Promise<{ code?: string; message?: string } | null> {
+async function updateCloudEvent(event: QueueableEvent): Promise<{ code?: string; message?: string } | null> {
   const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
   const { error } = await getSupabase().from(table).update(cloudRecordFor(event)).eq("id", event.id);
   return error ? { code: error.code, message: error.message } : null;
@@ -181,7 +201,7 @@ function isConnectivityError(message = ""): boolean {
   return !navigator.onLine || /fetch|network|connection|offline/i.test(message);
 }
 
-async function insertOrQueueCloudEvent(event: LedgerEvent): Promise<boolean> {
+async function insertOrQueueCloudEvent(event: QueueableEvent): Promise<boolean> {
   if (!navigator.onLine) {
     queueCloudEvent(event);
     return true;
@@ -246,6 +266,20 @@ function groupFromRow(row: GroupRow): Group {
     id: row.id, name: row.name, inviteCode: row.invite_code, vehicleName: row.vehicle_name,
     tankCapacityMl: row.tank_capacity_ml, mileageMPerLitre: row.mileage_m_per_litre,
     adminUserId: row.admin_user_id, createdAt: row.created_at,
+    setupStatus: row.setup_status ?? "complete",
+  };
+}
+
+function openingFromRow(row: OpeningRow, owners: OpeningOwnerRow[]): OpeningBalance {
+  return {
+    id: row.id, kind: "opening_balance", groupId: row.group_id, createdByUserId: row.created_by_user_id,
+    amountPaise: row.amount_paise, unitPricePaisePerLitre: row.unit_price_paise_per_litre,
+    volumeMl: row.volume_ml, ownershipMode: row.ownership_mode,
+    ownerShares: owners.filter((owner) => owner.opening_balance_id === row.id).map((owner) => ({
+      memberId: owner.member_id, shareBasisPoints: owner.share_basis_points,
+    })),
+    occurredAt: row.occurred_at, createdAt: row.created_at, updatedAt: row.updated_at,
+    deletedAt: row.deleted_at, note: row.note,
   };
 }
 
@@ -320,6 +354,7 @@ function localGroupData(groupId: string): GroupData | null {
     group,
     members: database.members.filter((item) => item.groupId === groupId),
     purchases: database.purchases.filter((item) => item.groupId === groupId),
+    openingBalances: database.openingBalances.filter((item) => item.groupId === groupId),
     rides: database.rides.filter((item) => item.groupId === groupId),
     payments: database.payments.filter((item) => item.groupId === groupId),
     presets: database.presets.filter((item) => item.groupId === groupId && item.memberId === currentMember.id),
@@ -348,16 +383,18 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
   }
   await flushPendingActions(selectedGroupId);
 
-  const [groupResult, membersResult, fuelResult, ridesResult, paymentsResult, revisionsResult, presetsResult] = await Promise.all([
+  const [groupResult, membersResult, openingResult, openingOwnersResult, fuelResult, ridesResult, paymentsResult, revisionsResult, presetsResult] = await Promise.all([
     supabase.from("groups").select("*").eq("id", selectedGroupId).maybeSingle(),
     supabase.from("members").select("*").eq("group_id", selectedGroupId).order("created_at"),
+    supabase.from("opening_balances").select("*").eq("group_id", selectedGroupId),
+    supabase.from("opening_balance_owners").select("*").eq("group_id", selectedGroupId),
     supabase.from("fuel_purchases").select("*").eq("group_id", selectedGroupId),
     supabase.from("rides").select("*").eq("group_id", selectedGroupId),
     supabase.from("payments").select("*").eq("group_id", selectedGroupId),
     supabase.from("event_revisions").select("*").eq("group_id", selectedGroupId).order("created_at", { ascending: false }),
     supabase.from("ride_presets").select("*").eq("group_id", selectedGroupId).order("display_order"),
   ]);
-  const error = groupResult.error ?? membersResult.error ?? fuelResult.error ?? ridesResult.error ?? paymentsResult.error ?? revisionsResult.error ?? presetsResult.error;
+  const error = groupResult.error ?? membersResult.error ?? openingResult.error ?? openingOwnersResult.error ?? fuelResult.error ?? ridesResult.error ?? paymentsResult.error ?? revisionsResult.error ?? presetsResult.error;
   if (error) throw new Error(error.message);
   if (!groupResult.data) {
     forgetActiveGroup();
@@ -380,6 +417,7 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
   return {
     group: groupFromRow(groupResult.data as unknown as GroupRow),
     members: memberRows.map(memberFromRow),
+    openingBalances: (openingResult.data as unknown as OpeningRow[]).map((row) => openingFromRow(row, openingOwnersResult.data as unknown as OpeningOwnerRow[])),
     purchases,
     rides,
     payments,
@@ -399,20 +437,28 @@ export async function loadCurrentGroup(groupId?: string | null): Promise<GroupDa
 }
 
 export async function createGroup(input: CreateGroupInput): Promise<GroupData> {
-  const volumeMl = litresFromMoney(input.initialAmountRupees, input.initialPricePerLitre);
   const capacityMl = Math.round(input.tankCapacityLitres * 1000);
-  if (volumeMl > capacityMl) throw new Error("The initial refill is larger than the tank capacity.");
+  const volumeMl = input.opening.state === "existing" ? Math.round(input.opening.volumeLitres * 1000) : 0;
+  const pricePaise = input.opening.state === "existing" ? Math.round(input.opening.pricePerLitre * 100) : 0;
+  const amountPaise = Math.round((volumeMl * pricePaise) / 1000);
+  if (volumeMl < 0 || volumeMl > capacityMl) throw new Error("Opening petrol must be between zero and the tank capacity.");
+  if (volumeMl > 0 && pricePaise <= 0) throw new Error("Enter a positive estimated petrol price.");
+  const setupStatus = input.opening.state === "deferred" ? "pending" : "complete";
+  const ownershipMode = input.opening.state === "existing" ? input.opening.ownershipMode : "empty";
+  if (input.opening.state === "existing" && volumeMl === 0) throw new Error("Enter an estimated amount of petrol greater than zero.");
   if (isCloudConfigured()) {
     await ensureCloudUser();
-    const { data, error } = await getSupabase().rpc("create_fuelshare_group", {
+    const { data, error } = await getSupabase().rpc("create_fuelshare_group_v2", {
       p_group_name: input.groupName,
       p_vehicle_name: input.vehicleName,
       p_display_name: input.displayName,
       p_tank_capacity_ml: capacityMl,
       p_mileage_m_per_litre: Math.round(input.mileageKmPerLitre * 1000),
-      p_initial_amount_paise: Math.round(input.initialAmountRupees * 100),
-      p_initial_unit_price_paise: Math.round(input.initialPricePerLitre * 100),
-      p_initial_volume_ml: volumeMl,
+      p_setup_status: setupStatus,
+      p_opening_amount_paise: amountPaise,
+      p_opening_unit_price_paise: pricePaise,
+      p_opening_volume_ml: volumeMl,
+      p_ownership_mode: ownershipMode,
     });
     if (error) throw new Error(error.message);
     const result = data as unknown as { group_id: string };
@@ -429,14 +475,16 @@ export async function createGroup(input: CreateGroupInput): Promise<GroupData> {
   const memberId = crypto.randomUUID();
   const group: Group = {
     id: groupId, name: input.groupName.trim(), inviteCode: crypto.randomUUID(), vehicleName: input.vehicleName.trim(),
-    tankCapacityMl: capacityMl, mileageMPerLitre: Math.round(input.mileageKmPerLitre * 1000), adminUserId: userId, createdAt: now,
+    tankCapacityMl: capacityMl, mileageMPerLitre: Math.round(input.mileageKmPerLitre * 1000), adminUserId: userId,
+    setupStatus, createdAt: now,
   };
   database.groups.push(group);
   database.members.push({ id: memberId, groupId, userId, displayName: input.displayName.trim(), role: "admin", createdAt: now });
-  database.purchases.push({
-    id: crypto.randomUUID(), kind: "fuel_purchase", groupId, payerMemberId: memberId, createdByUserId: userId,
-    amountPaise: Math.round(input.initialAmountRupees * 100), unitPricePaisePerLitre: Math.round(input.initialPricePerLitre * 100),
-    volumeMl, isFullTank: false, occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "Initial known-tank refill",
+  if (setupStatus === "complete") database.openingBalances.push({
+    id: crypto.randomUUID(), kind: "opening_balance", groupId, createdByUserId: userId,
+    amountPaise, unitPricePaisePerLitre: pricePaise, volumeMl, ownershipMode,
+    ownerShares: ownershipMode === "single" ? [{ memberId, shareBasisPoints: 10_000 }] : [],
+    occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "Estimated opening tank balance",
   });
   saveLocalDatabase(database);
   rememberGroup(groupId);
@@ -481,17 +529,107 @@ export async function joinGroup(inviteCode: string, displayName: string): Promis
 function validateLocal(database: LocalDatabase, groupId: string): void {
   const group = database.groups.find((entry) => entry.id === groupId);
   if (!group) throw new Error("Group not found.");
+  const activeOpenings = database.openingBalances.filter((entry) => entry.groupId === groupId && !entry.deletedAt);
+  if (activeOpenings.length > 1) throw new Error("Only one active opening balance is allowed.");
+  const firstNormalAt = [
+    ...database.purchases.filter((entry) => entry.groupId === groupId && !entry.deletedAt),
+    ...database.rides.filter((entry) => entry.groupId === groupId && !entry.deletedAt),
+  ].map((entry) => entry.occurredAt).sort()[0];
+  if (activeOpenings[0] && firstNormalAt && activeOpenings[0].occurredAt > firstNormalAt) {
+    throw new Error("The opening balance must occur before rides and refills.");
+  }
   const result = calculateLedger(
     group,
     database.members.filter((entry) => entry.groupId === groupId),
     database.purchases.filter((entry) => entry.groupId === groupId),
     database.rides.filter((entry) => entry.groupId === groupId),
     database.payments.filter((entry) => entry.groupId === groupId),
+    database.openingBalances.filter((entry) => entry.groupId === groupId),
   );
   if (result.issues[0]) throw new Error(result.issues[0].message);
 }
 
+function assertSetupComplete(data: GroupData): void {
+  if (data.group.setupStatus !== "complete") throw new Error("Finish the opening tank setup before logging rides or refills.");
+}
+
+export function validateOpeningBalanceInput(
+  input: SaveOpeningBalanceInput,
+  capacityMl: number,
+  joinedMemberIds: string[],
+): { volumeMl: number; pricePaise: number; amountPaise: number; ownerShares: OpeningBalance["ownerShares"] } {
+  const volumeMl = Math.round(input.volumeLitres * 1000);
+  const pricePaise = Math.round(input.pricePerLitre * 100);
+  const selectedIds = [...new Set(input.ownerMemberIds)];
+  if (volumeMl < 0 || volumeMl > capacityMl) throw new Error("Opening petrol must be between zero and the tank capacity.");
+  if (volumeMl > 0 && pricePaise <= 0) throw new Error("Enter a positive estimated petrol price.");
+  if (volumeMl === 0 && input.ownershipMode !== "empty") throw new Error("Use the empty-tank option when the opening volume is zero.");
+  if (volumeMl > 0 && input.ownershipMode === "empty") throw new Error("Choose who owns the opening petrol.");
+  if (selectedIds.some((memberId) => !joinedMemberIds.includes(memberId))) throw new Error("Every opening fuel owner must be a joined member.");
+  if (input.ownershipMode === "single" && selectedIds.length !== 1) throw new Error("Select one member who paid for the opening petrol.");
+  if (input.ownershipMode === "equal" && selectedIds.length < 2) throw new Error("Equal ownership requires at least two selected members.");
+  if ((input.ownershipMode === "shared" || input.ownershipMode === "empty") && selectedIds.length > 0) {
+    throw new Error("Shared opening fuel cannot have a reimbursable owner.");
+  }
+  const ownerShares = input.ownershipMode === "single"
+    ? [{ memberId: selectedIds[0], shareBasisPoints: 10_000 }]
+    : input.ownershipMode === "equal" ? equalOwnershipShares(selectedIds) : [];
+  if (ownerShares.length > 0 && ownerShares.reduce((sum, share) => sum + share.shareBasisPoints, 0) !== 10_000) {
+    throw new Error("Opening ownership shares must total exactly 100%.");
+  }
+  return { volumeMl, pricePaise, amountPaise: Math.round((volumeMl * pricePaise) / 1000), ownerShares };
+}
+
+export async function saveOpeningBalance(data: GroupData, input: SaveOpeningBalanceInput): Promise<void> {
+  if (data.currentUserId !== data.group.adminUserId) throw new Error("Only the group admin can finish or correct the opening tank setup.");
+  const current = data.openingBalances.find((entry) => !entry.deletedAt);
+  const values = validateOpeningBalanceInput(input, data.group.tankCapacityMl, data.members.map((member) => member.id));
+  if (data.mode === "cloud") {
+    const { error } = await getSupabase().rpc("save_opening_balance", {
+      p_group_id: data.group.id,
+      p_opening_balance_id: current?.id ?? null,
+      p_volume_ml: values.volumeMl,
+      p_unit_price_paise: values.pricePaise,
+      p_amount_paise: values.amountPaise,
+      p_ownership_mode: input.ownershipMode,
+      p_owner_shares: values.ownerShares,
+    });
+    if (error) throw new Error(error.message);
+    return;
+  }
+
+  const database = loadLocalDatabase();
+  const group = database.groups.find((entry) => entry.id === data.group.id);
+  if (!group) throw new Error("Group not found.");
+  const storedCurrent = database.openingBalances.find((entry) => entry.groupId === group.id && !entry.deletedAt);
+  const now = new Date().toISOString();
+  if (storedCurrent) {
+    database.revisions.unshift({
+      id: crypto.randomUUID(), groupId: group.id, entityType: "opening_balance", entityId: storedCurrent.id,
+      changedByUserId: data.currentUserId, previousData: { ...storedCurrent, ownerShares: storedCurrent.ownerShares.map((share) => ({ ...share })) }, createdAt: now,
+    });
+    Object.assign(storedCurrent, {
+      volumeMl: values.volumeMl, unitPricePaisePerLitre: values.pricePaise, amountPaise: values.amountPaise,
+      ownershipMode: input.ownershipMode, ownerShares: values.ownerShares, updatedAt: now,
+    });
+  } else {
+    if (database.purchases.some((entry) => entry.groupId === group.id && !entry.deletedAt) || database.rides.some((entry) => entry.groupId === group.id && !entry.deletedAt)) {
+      throw new Error("The opening balance must be set before rides and refills.");
+    }
+    database.openingBalances.push({
+      id: crypto.randomUUID(), kind: "opening_balance", groupId: group.id, createdByUserId: data.currentUserId,
+      volumeMl: values.volumeMl, unitPricePaisePerLitre: values.pricePaise, amountPaise: values.amountPaise,
+      ownershipMode: input.ownershipMode, ownerShares: values.ownerShares,
+      occurredAt: group.createdAt, createdAt: now, updatedAt: now, deletedAt: null, note: "Estimated opening tank balance",
+    });
+  }
+  group.setupStatus = "complete";
+  validateLocal(database, group.id);
+  saveLocalDatabase(database);
+}
+
 export async function addRide(data: GroupData, input: CreateRideInput): Promise<RideSaveResult> {
+  assertSetupComplete(data);
   const distanceM = Math.round(input.distanceKm * 1000);
   const consumedMl = fuelForRide(input.distanceKm, data.group.mileageMPerLitre / 1000);
   const now = new Date().toISOString();
@@ -704,6 +842,7 @@ export async function voidRide(data: GroupData, ride: Ride): Promise<void> {
 }
 
 export async function addFuel(data: GroupData, input: CreateFuelInput): Promise<void> {
+  assertSetupComplete(data);
   const volumeMl = litresFromMoney(input.amountRupees, input.pricePerLitre);
   const now = new Date().toISOString();
   const event: FuelPurchase = {
@@ -752,13 +891,13 @@ export interface EventUpdateInput {
   note?: string;
 }
 
-function localCollection(database: LocalDatabase, kind: EventKind): LedgerEvent[] {
+function localCollection(database: LocalDatabase, kind: Exclude<EventKind, "opening_balance">): QueueableEvent[] {
   if (kind === "fuel_purchase") return database.purchases;
   if (kind === "ride") return database.rides;
   return database.payments;
 }
 
-export async function updateEvent(data: GroupData, event: LedgerEvent, input: EventUpdateInput): Promise<void> {
+export async function updateEvent(data: GroupData, event: QueueableEvent, input: EventUpdateInput): Promise<void> {
   if (event.createdByUserId !== data.currentUserId) throw new Error("You can only correct entries that you recorded.");
   if (data.mode === "cloud") {
     const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
@@ -823,6 +962,9 @@ export function subscribeToGroup(groupId: string, onChange: () => void): () => v
   if (!isCloudConfigured()) return () => undefined;
   const supabase = getSupabase();
   const channel = supabase.channel(`fuelshare:${groupId}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "groups", filter: `id=eq.${groupId}` }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "opening_balances", filter: `group_id=eq.${groupId}` }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "opening_balance_owners", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "fuel_purchases", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "rides", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "payments", filter: `group_id=eq.${groupId}` }, onChange)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { calculateLedger, fuelForRide, litresFromMoney } from "@/lib/ledger";
-import type { FuelPurchase, Group, Member, Ride, SettlementPayment } from "@/lib/types";
+import { calculateLedger, equalOwnershipShares, fuelForRide, litresFromMoney } from "@/lib/ledger";
+import type { FuelPurchase, Group, Member, OpeningBalance, Ride, SettlementPayment } from "@/lib/types";
 
 const group: Group = {
   id: "group",
@@ -10,6 +10,7 @@ const group: Group = {
   tankCapacityMl: 10_000,
   mileageMPerLitre: 45_000,
   adminUserId: "alice-user",
+  setupStatus: "complete",
   createdAt: "2026-01-01T00:00:00.000Z",
 };
 
@@ -33,6 +34,16 @@ function ride(overrides: Partial<Ride> = {}): Ride {
     distanceM: 45_000, efficiencyMPerLitre: 45_000, consumedMl: 1_000,
     presetId: null, presetLabel: null,
     occurredAt: "2026-01-02T10:00:00.000Z", createdAt: group.createdAt, updatedAt: group.createdAt, deletedAt: null, note: "", ...overrides,
+  };
+}
+
+function opening(overrides: Partial<OpeningBalance> = {}): OpeningBalance {
+  return {
+    id: "opening", kind: "opening_balance", groupId: "group", createdByUserId: "alice-user",
+    amountPaise: 20_000, unitPricePaisePerLitre: 10_000, volumeMl: 2_000,
+    ownershipMode: "single", ownerShares: [{ memberId: "alice", shareBasisPoints: 10_000 }],
+    occurredAt: "2026-01-01T00:00:00.000Z", createdAt: group.createdAt, updatedAt: group.createdAt,
+    deletedAt: null, note: "Estimated opening tank balance", ...overrides,
   };
 }
 
@@ -139,5 +150,93 @@ describe("invalid timelines", () => {
   it("reports tank overflow", () => {
     const result = calculateLedger(group, members, [purchase({ volumeMl: 11_000 })], [], []);
     expect(result.issues[0]?.code).toBe("tank_overflow");
+  });
+});
+
+describe("opening tank balance", () => {
+  it("allows an empty opening followed by a partial refill", () => {
+    const empty = opening({ amountPaise: 0, unitPricePaisePerLitre: 0, volumeMl: 0, ownershipMode: "empty", ownerShares: [] });
+    const result = calculateLedger(group, members, [purchase({ amountPaise: 10_000, volumeMl: 1_000 })], [], [], [empty]);
+    expect(result.tank.remainingMl).toBe(1_000);
+    expect(result.issues).toEqual([]);
+  });
+
+  it("credits a single opening owner when another member consumes it", () => {
+    const result = calculateLedger(group, members, [], [ride()], [], [opening()]);
+    expect(result.memberBalances.find((balance) => balance.memberId === "alice")?.balancePaise).toBe(10_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.balancePaise).toBe(-10_000);
+  });
+
+  it("creates no debt when the single opening owner consumes it", () => {
+    const result = calculateLedger(group, members, [], [ride({ riderMemberId: "alice" })], [], [opening()]);
+    expect(result.memberBalances.every((balance) => balance.balancePaise === 0)).toBe(true);
+  });
+
+  it("credits two equal owners proportionally", () => {
+    const equal = opening({ ownershipMode: "equal", ownerShares: equalOwnershipShares(["alice", "bob"]) });
+    const result = calculateLedger(group, members, [], [ride({ riderMemberId: "cara" })], [], [equal]);
+    expect(result.memberBalances.find((balance) => balance.memberId === "alice")?.balancePaise).toBe(5_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.balancePaise).toBe(5_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "cara")?.balancePaise).toBe(-10_000);
+  });
+
+  it("preserves every paise when three owners split a rounded cost", () => {
+    const dave: Member = { id: "dave", groupId: "group", userId: "dave-user", displayName: "Dave", role: "member", createdAt: group.createdAt };
+    const equal = opening({ amountPaise: 101, volumeMl: 1_000, ownershipMode: "equal", ownerShares: equalOwnershipShares(["alice", "bob", "cara"]) });
+    const result = calculateLedger(group, [...members, dave], [], [ride({ riderMemberId: "dave" })], [], [equal]);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance.balancePaise]));
+    expect([balances.get("alice"), balances.get("bob"), balances.get("cara")]).toEqual([34, 34, 33]);
+    expect(balances.get("dave")).toBe(-101);
+    expect(result.memberBalances.reduce((sum, balance) => sum + balance.balancePaise, 0)).toBe(0);
+  });
+
+  it("carries ownership rounding across multiple ride slices", () => {
+    const equal = opening({
+      amountPaise: 2,
+      volumeMl: 2,
+      ownershipMode: "equal",
+      ownerShares: equalOwnershipShares(["alice", "bob"]),
+    });
+    const rides = [
+      ride({ id: "first-slice", riderMemberId: "cara", consumedMl: 1, distanceM: 45, occurredAt: "2026-01-02T10:00:00.000Z" }),
+      ride({ id: "second-slice", riderMemberId: "cara", consumedMl: 1, distanceM: 45, occurredAt: "2026-01-03T10:00:00.000Z" }),
+    ];
+
+    const result = calculateLedger(group, members, [], rides, [], [equal]);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance.balancePaise]));
+    expect(balances.get("alice")).toBe(1);
+    expect(balances.get("bob")).toBe(1);
+    expect(balances.get("cara")).toBe(-2);
+    expect(result.memberBalances.reduce((sum, balance) => sum + balance.balancePaise, 0)).toBe(0);
+  });
+
+  it("ignores an equal owner's own portion", () => {
+    const equal = opening({ ownershipMode: "equal", ownerShares: equalOwnershipShares(["alice", "bob"]) });
+    const result = calculateLedger(group, members, [], [ride({ riderMemberId: "alice" })], [], [equal]);
+    expect(result.memberBalances.find((balance) => balance.memberId === "alice")?.balancePaise).toBe(-5_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.balancePaise).toBe(5_000);
+  });
+
+  it("counts shared legacy fuel in ride cost without creating debt", () => {
+    const shared = opening({ ownershipMode: "shared", ownerShares: [] });
+    const result = calculateLedger(group, members, [], [ride()], [], [shared]);
+    expect(result.memberBalances.every((balance) => balance.balancePaise === 0)).toBe(true);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.rideCostPaise).toBe(10_000);
+    expect(result.tank.sharedOpeningMl).toBe(1_000);
+    expect(result.tank.sharedOpeningValuePaise).toBe(10_000);
+  });
+
+  it("consumes opening fuel before a later differently priced refill", () => {
+    const later = purchase({ id: "later", payerMemberId: "cara", createdByUserId: "cara-user", amountPaise: 36_000, unitPricePaisePerLitre: 12_000, volumeMl: 3_000, occurredAt: "2026-01-02T00:00:00.000Z" });
+    const result = calculateLedger(group, members, [later], [ride({ consumedMl: 3_000, distanceM: 135_000, occurredAt: "2026-01-03T00:00:00.000Z" })], [], [opening()]);
+    expect(result.memberBalances.find((balance) => balance.memberId === "alice")?.balancePaise).toBe(20_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "cara")?.balancePaise).toBe(12_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.rideCostPaise).toBe(32_000);
+    expect(result.tank.remainingValuePaise).toBe(24_000);
+  });
+
+  it("keeps legacy groups without an opening event on their previous accounting path", () => {
+    const result = calculateLedger(group, members, [purchase()], [ride()], []);
+    expect(result.suggestedTransfers).toEqual([{ fromMemberId: "bob", toMemberId: "alice", amountPaise: 10_000 }]);
   });
 });

@@ -1,13 +1,18 @@
 import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  addFuel,
+  addRide,
+  createGroup,
   createRidePreset,
   dashboardRidePresets,
   deleteRidePreset,
   loadCurrentGroup,
   logRideFromPreset,
+  saveOpeningBalance,
   selectAccessibleGroupId,
   updateRidePreset,
+  validateOpeningBalanceInput,
   voidRide,
 } from "@/lib/repository";
 import type { FuelPurchase, GroupData, Member, RidePreset } from "@/lib/types";
@@ -28,8 +33,8 @@ function preset(overrides: Partial<RidePreset> = {}): RidePreset {
 
 function groupData(overrides: Partial<GroupData> = {}): GroupData {
   return {
-    group: { id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000, mileageMPerLitre: 40_000, adminUserId: "alice-user", createdAt: now },
-    members: [member("alice", "alice-user"), member("bob", "bob-user")], purchases: [], rides: [], payments: [], presets: [], revisions: [],
+    group: { id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000, mileageMPerLitre: 40_000, adminUserId: "alice-user", setupStatus: "complete", createdAt: now },
+    members: [member("alice", "alice-user"), member("bob", "bob-user")], purchases: [], openingBalances: [], rides: [], payments: [], presets: [], revisions: [],
     currentUserId: "alice-user", currentMemberId: "alice", pendingEventIds: [], mode: "local", ...overrides,
   };
 }
@@ -43,7 +48,7 @@ function seedLocal(data: GroupData): void {
   localStorage.setItem("fuelshare_user_id", data.currentUserId);
   localStorage.setItem("fuelshare_active_group", data.group.id);
   localStorage.setItem("fuelshare_database_v1", JSON.stringify({
-    groups: [data.group], members: data.members, purchases: [purchase], rides: data.rides,
+    groups: [data.group], members: data.members, purchases: [purchase], openingBalances: data.openingBalances, rides: data.rides,
     payments: data.payments, presets: data.presets, revisions: data.revisions,
   }));
 }
@@ -52,6 +57,8 @@ beforeEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
 });
+
+vi.mock("@/lib/supabase", () => ({ isCloudConfigured: () => false, getSupabase: vi.fn() }));
 
 describe("selectAccessibleGroupId", () => {
   it("keeps the preferred group when the cloud user is a member", () => {
@@ -182,11 +189,61 @@ describe("ride presets", () => {
   });
 
   it("defines member-private CRUD policies in the additive migration", () => {
-    const migration = readFileSync("supabase/migrations/003_ride_presets.sql", "utf8");
+    const migration = readFileSync("supabase/migrations/004_ride_presets.sql", "utf8");
     expect(migration).toContain("ride_presets_select_own");
     expect(migration).toContain("ride_presets_insert_own");
     expect(migration).toContain("ride_presets_update_own");
     expect(migration).toContain("ride_presets_delete_own");
     expect(migration.match(/public\.is_own_member\(member_id, group_id\)/g)).toHaveLength(5);
+  });
+});
+
+describe("opening balance validation", () => {
+  it("rejects opening fuel above tank capacity", () => {
+    expect(() => validateOpeningBalanceInput({
+      volumeLitres: 6, pricePerLitre: 100, ownershipMode: "single", ownerMemberIds: ["alice"],
+    }, 5_000, ["alice"])).toThrow("between zero and the tank capacity");
+  });
+
+  it("requires at least two joined members for equal ownership", () => {
+    expect(() => validateOpeningBalanceInput({
+      volumeLitres: 2, pricePerLitre: 100, ownershipMode: "equal", ownerMemberIds: ["alice"],
+    }, 5_000, ["alice"])).toThrow("at least two");
+  });
+
+  it("rejects a correction that would overflow the historical tank", async () => {
+    const data = await createGroup({
+      groupName: "Flat", vehicleName: "Activa", displayName: "Alice",
+      tankCapacityLitres: 10, mileageKmPerLitre: 45, opening: { state: "empty" },
+    });
+    await addFuel(data, { amountRupees: 900, pricePerLitre: 100, isFullTank: false, occurredAt: "2099-01-01T00:00:00.000Z" });
+    const fresh = await loadCurrentGroup(data.group.id);
+    await expect(saveOpeningBalance(fresh!, {
+      volumeLitres: 2, pricePerLitre: 100, ownershipMode: "single", ownerMemberIds: [data.currentMemberId],
+    })).rejects.toThrow("above its configured capacity");
+  });
+
+  it("rejects a correction that would underflow the historical tank", async () => {
+    const data = await createGroup({
+      groupName: "Flat", vehicleName: "Activa", displayName: "Alice", tankCapacityLitres: 10, mileageKmPerLitre: 45,
+      opening: { state: "existing", volumeLitres: 2, pricePerLitre: 100, ownershipMode: "single" },
+    });
+    await addRide(data, { distanceKm: 67.5, occurredAt: "2099-01-01T00:00:00.000Z" });
+    const fresh = await loadCurrentGroup(data.group.id);
+    await expect(saveOpeningBalance(fresh!, {
+      volumeLitres: 1, pricePerLitre: 100, ownershipMode: "single", ownerMemberIds: [data.currentMemberId],
+    })).rejects.toThrow("more fuel than the ledger says was available");
+  });
+
+  it("preserves the previous opening values in revision history", async () => {
+    const data = await createGroup({
+      groupName: "Flat", vehicleName: "Activa", displayName: "Alice", tankCapacityLitres: 10, mileageKmPerLitre: 45,
+      opening: { state: "existing", volumeLitres: 2, pricePerLitre: 100, ownershipMode: "single" },
+    });
+    await saveOpeningBalance(data, {
+      volumeLitres: 1.5, pricePerLitre: 101, ownershipMode: "single", ownerMemberIds: [data.currentMemberId],
+    });
+    const fresh = await loadCurrentGroup(data.group.id);
+    expect(fresh?.revisions[0]).toMatchObject({ entityType: "opening_balance", previousData: { volumeMl: 2_000, amountPaise: 20_000 } });
   });
 });

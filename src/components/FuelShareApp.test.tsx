@@ -17,6 +17,7 @@ vi.mock("@/lib/repository", () => ({
   loadCurrentGroup: vi.fn().mockResolvedValue(null),
   logRideFromPreset: vi.fn(),
   moveRidePreset: vi.fn(),
+  saveOpeningBalance: vi.fn(),
   subscribeToGroup: vi.fn(() => () => undefined),
   updateEvent: vi.fn(),
   updateGroupSettings: vi.fn(),
@@ -34,10 +35,10 @@ function preset(label = "College", order = 0): RidePreset {
 
 function dashboardData(presets: RidePreset[] = []): GroupData {
   return {
-    group: { id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000, mileageMPerLitre: 45_000, adminUserId: "user", createdAt: timestamp },
+    group: { id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000, mileageMPerLitre: 45_000, adminUserId: "user", setupStatus: "complete", createdAt: timestamp },
     members: [{ id: "member", groupId: "group", userId: "user", displayName: "Aditya", role: "admin", createdAt: timestamp }],
     purchases: [{ id: "fuel", kind: "fuel_purchase", groupId: "group", payerMemberId: "member", createdByUserId: "user", amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000, isFullTank: false, occurredAt: timestamp, createdAt: timestamp, updatedAt: timestamp, deletedAt: null, note: "" }],
-    rides: [], payments: [], presets, revisions: [], currentUserId: "user", currentMemberId: "member", pendingEventIds: [], mode: "local",
+    openingBalances: [], rides: [], payments: [], presets, revisions: [], currentUserId: "user", currentMemberId: "member", pendingEventIds: [], mode: "local",
   };
 }
 
@@ -47,11 +48,37 @@ beforeEach(() => {
 });
 
 describe("FuelShareApp", () => {
-  it("shows low-friction group setup for a new user", async () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(loadCurrentGroup).mockResolvedValue(null);
+  });
+
+  it("shows the two-step opening tank onboarding", async () => {
+    const user = userEvent.setup();
     render(<FuelShareApp />);
     expect(await screen.findByRole("heading", { name: "Petrol tracking your group will actually use." })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Create FuelShare" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Scooter details" })).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Creator's display name"), "Alice");
+    await user.click(screen.getByRole("button", { name: "Continue to tank state" }));
+    expect(screen.getByRole("heading", { name: "Current tank state" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /The tank is empty/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /There is petrol in the tank/ })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Set this up after members join/ })).toBeInTheDocument();
     expect(screen.getByText(/Local mode/)).toBeInTheDocument();
+  });
+
+  it("shows estimated opening value and ownership choices", async () => {
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+    await user.type(await screen.findByLabelText("Creator's display name"), "Alice");
+    await user.click(screen.getByRole("button", { name: "Continue to tank state" }));
+    await user.click(screen.getByRole("radio", { name: /There is petrol in the tank/ }));
+    await user.click(screen.getByRole("button", { name: "½" }));
+    await user.type(screen.getByLabelText("Estimated petrol price per litre (₹)"), "100");
+    expect(screen.getByText("₹265")).toBeInTheDocument();
+    expect(screen.getByText("Paid by one member")).toBeInTheDocument();
+    expect(screen.getByText("Split equally")).toBeInTheDocument();
+    expect(screen.getByText("Shared old petrol — no repayment")).toBeInTheDocument();
   });
 
   it("shows display-name onboarding from an invite link", () => {
@@ -70,10 +97,12 @@ describe("FuelShareApp", () => {
         tankCapacityMl: 10_000,
         mileageMPerLitre: 45_000,
         adminUserId: "user",
+        setupStatus: "complete",
         createdAt: "2026-01-01T00:00:00.000Z",
       },
       members: [{ id: "member", groupId: "group", userId: "user", displayName: "Alice", role: "admin", createdAt: "2026-01-01T00:00:00.000Z" }],
       purchases: [],
+      openingBalances: [],
       rides: [],
       payments: [],
       presets: [],
@@ -100,14 +129,41 @@ describe("FuelShareApp", () => {
     }));
   });
 
+  it("shows the opening balance and its previous values in activity", async () => {
+    const data: GroupData = {
+      group: {
+        id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000,
+        mileageMPerLitre: 45_000, adminUserId: "user", setupStatus: "complete", createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      members: [{ id: "member", groupId: "group", userId: "user", displayName: "Alice", role: "admin", createdAt: "2026-01-01T00:00:00.000Z" }],
+      openingBalances: [{
+        id: "opening", kind: "opening_balance", groupId: "group", createdByUserId: "user", amountPaise: 20_000,
+        unitPricePaisePerLitre: 10_000, volumeMl: 2_000, ownershipMode: "single",
+        ownerShares: [{ memberId: "member", shareBasisPoints: 10_000 }], occurredAt: "2026-01-01T00:00:00.000Z",
+        createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z", deletedAt: null, note: "",
+      }],
+      purchases: [], rides: [], payments: [], presets: [],
+      revisions: [{ id: "revision", groupId: "group", entityType: "opening_balance", entityId: "opening", changedByUserId: "user", previousData: { volumeMl: 1_500, amountPaise: 15_000, ownershipMode: "shared" }, createdAt: "2026-01-02T00:00:00.000Z" }],
+      currentUserId: "user", currentMemberId: "member", pendingEventIds: [], mode: "local",
+    };
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    expect(screen.getByText("Opening tank balance")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "1 correction recorded" }));
+    expect(screen.getByText(/1.5 L opening fuel worth ₹150/)).toBeInTheDocument();
+  });
+
   it("shows full-tank adjustment details and status in activity history", async () => {
     const occurredAt = "2026-01-02T10:00:00.000Z";
     const data: GroupData = {
       group: {
         id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000,
-        mileageMPerLitre: 45_000, adminUserId: "user", createdAt: "2026-01-01T00:00:00.000Z",
+        mileageMPerLitre: 45_000, adminUserId: "user", setupStatus: "complete", createdAt: "2026-01-01T00:00:00.000Z",
       },
       members: [{ id: "member", groupId: "group", userId: "user", displayName: "Alice", role: "admin", createdAt: "2026-01-01T00:00:00.000Z" }],
+      openingBalances: [],
       purchases: [{
         id: "full-refill", kind: "fuel_purchase", groupId: "group", payerMemberId: "member", createdByUserId: "user",
         amountPaise: 50_000, unitPricePaisePerLitre: 10_000, volumeMl: 5_000, isFullTank: true,
@@ -135,6 +191,23 @@ describe("FuelShareApp", () => {
     expect(screen.getByText(/full-tank calibration: 0\.00 L estimated.*5\.0 L actual \(\+5\.0 L\)/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "2 corrections recorded" }));
     expect(screen.getAllByText(/₹500 refill at ₹100\/L.*full-tank calibration/)).toHaveLength(2);
+  });
+
+  it("blocks ride and refill actions while showing the finish-setup action", async () => {
+    const pending: GroupData = {
+      group: {
+        id: "group", name: "Flat", inviteCode: "invite", vehicleName: "Activa", tankCapacityMl: 10_000,
+        mileageMPerLitre: 45_000, adminUserId: "user", setupStatus: "pending", createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      members: [{ id: "member", groupId: "group", userId: "user", displayName: "Alice", role: "admin", createdAt: "2026-01-01T00:00:00.000Z" }],
+      openingBalances: [], purchases: [], rides: [], payments: [], presets: [], revisions: [], currentUserId: "user", currentMemberId: "member", pendingEventIds: [], mode: "local",
+    };
+    vi.mocked(loadCurrentGroup).mockResolvedValue(pending);
+    render(<FuelShareApp />);
+    expect(await screen.findByRole("heading", { name: "Finish tank setup" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Finish tank setup" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Log ride/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add petrol/ })).not.toBeInTheDocument();
   });
 });
 

@@ -29,7 +29,9 @@ The production PWA caches its application shell. New rides, refills, and repayme
 
 ## First-use baseline
 
-For a trustworthy starting balance, begin with a near-empty or otherwise known tank and record the full first refill during group setup. The app calculates later usage from the configured mileage, so displayed litres and rupee value are estimates rather than a physical fuel-sensor reading.
+Group setup records an opening tank balance before normal rides and refills. Start with an empty tank, estimate the petrol already present, or invite members before finishing setup. Existing petrol can belong to one member, be split equally among selected members, or be tracked as non-reimbursable shared opening fuel. A full first refill is not required.
+
+The app calculates later usage from the configured mileage, so displayed litres, price, and rupee value remain estimates rather than a physical fuel-sensor reading. Opening-balance corrections keep an audit record and are rejected if they would make the historical tank overflow or underflow.
 
 ## Commands
 
