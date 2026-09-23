@@ -14,7 +14,11 @@ import type {
   Member,
   PaymentMethod,
   Ride,
+  RidePreset,
+  RideSaveResult,
   SettlementPayment,
+  CreateRidePresetInput,
+  UpdateRidePresetInput,
 } from "@/lib/types";
 
 const LOCAL_DATABASE_KEY = "fuelshare_database_v1";
@@ -29,10 +33,12 @@ interface LocalDatabase {
   rides: Ride[];
   payments: SettlementPayment[];
   revisions: EventRevision[];
+  presets: RidePreset[];
 }
 
 interface PendingCloudAction {
   event: LedgerEvent;
+  operation?: "insert" | "update";
 }
 
 interface GroupRow {
@@ -64,7 +70,14 @@ interface FuelRow {
 interface RideRow {
   id: string; group_id: string; rider_member_id: string; created_by_user_id: string;
   distance_m: number; efficiency_m_per_litre: number; consumed_ml: number;
+  preset_id?: string | null; preset_label?: string | null;
   occurred_at: string; created_at: string; updated_at: string; deleted_at: string | null; note: string;
+}
+
+interface RidePresetRow {
+  id: string; group_id: string; member_id: string; label: string; distance_m: number;
+  is_pinned: boolean; display_order: number; last_used_at: string | null; usage_count: number;
+  created_at: string; updated_at: string;
 }
 
 interface PaymentRow {
@@ -79,14 +92,15 @@ interface RevisionRow {
 }
 
 function emptyDatabase(): LocalDatabase {
-  return { groups: [], members: [], purchases: [], rides: [], payments: [], revisions: [] };
+  return { groups: [], members: [], purchases: [], rides: [], payments: [], revisions: [], presets: [] };
 }
 
 function loadLocalDatabase(): LocalDatabase {
   const raw = window.localStorage.getItem(LOCAL_DATABASE_KEY);
   if (!raw) return emptyDatabase();
   try {
-    return JSON.parse(raw) as LocalDatabase;
+    const parsed = JSON.parse(raw) as LocalDatabase;
+    return { ...parsed, presets: parsed.presets ?? [] };
   } catch {
     return emptyDatabase();
   }
@@ -112,7 +126,15 @@ function savePendingActions(actions: PendingCloudAction[]): void {
 
 function queueCloudEvent(event: LedgerEvent): void {
   const actions = loadPendingActions();
-  if (!actions.some((action) => action.event.id === event.id)) actions.push({ event });
+  if (!actions.some((action) => action.event.id === event.id && (action.operation ?? "insert") === "insert")) actions.push({ event, operation: "insert" });
+  savePendingActions(actions);
+}
+
+function queueCloudUpdate(event: LedgerEvent): void {
+  const actions = loadPendingActions();
+  const existing = actions.find((action) => action.event.id === event.id && action.operation === "update");
+  if (existing) existing.event = event;
+  else actions.push({ event, operation: "update" });
   savePendingActions(actions);
 }
 
@@ -135,6 +157,7 @@ function cloudRecordFor(event: LedgerEvent): Record<string, string | number | bo
   if (event.kind === "ride") return {
     ...base, rider_member_id: event.riderMemberId, distance_m: event.distanceM,
     efficiency_m_per_litre: event.efficiencyMPerLitre, consumed_ml: event.consumedMl,
+    preset_id: event.presetId, preset_label: event.presetLabel,
   };
   return {
     ...base, payer_member_id: event.payerMemberId, recipient_member_id: event.recipientMemberId,
@@ -148,20 +171,26 @@ async function insertCloudEvent(event: LedgerEvent): Promise<{ code?: string; me
   return error ? { code: error.code, message: error.message } : null;
 }
 
+async function updateCloudEvent(event: LedgerEvent): Promise<{ code?: string; message?: string } | null> {
+  const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
+  const { error } = await getSupabase().from(table).update(cloudRecordFor(event)).eq("id", event.id);
+  return error ? { code: error.code, message: error.message } : null;
+}
+
 function isConnectivityError(message = ""): boolean {
   return !navigator.onLine || /fetch|network|connection|offline/i.test(message);
 }
 
-async function insertOrQueueCloudEvent(event: LedgerEvent): Promise<void> {
+async function insertOrQueueCloudEvent(event: LedgerEvent): Promise<boolean> {
   if (!navigator.onLine) {
     queueCloudEvent(event);
-    return;
+    return true;
   }
   const error = await insertCloudEvent(event);
-  if (!error || error.code === "23505") return;
+  if (!error || error.code === "23505") return false;
   if (isConnectivityError(error.message)) {
     queueCloudEvent(event);
-    return;
+    return true;
   }
   throw new Error(error.message ?? "Could not save this entry.");
 }
@@ -175,7 +204,9 @@ async function flushPendingActions(groupId: string): Promise<void> {
       remaining.push(action);
       continue;
     }
-    const error = await insertCloudEvent(action.event);
+    const error = (action.operation ?? "insert") === "insert"
+      ? await insertCloudEvent(action.event)
+      : await updateCloudEvent(action.event);
     if (error && error.code !== "23505") remaining.push(action);
     if (error && isConnectivityError(error.message)) {
       remaining.push(...actions.slice(actions.indexOf(action) + 1));
@@ -238,8 +269,18 @@ function rideFromRow(row: RideRow): Ride {
     id: row.id, kind: "ride", groupId: row.group_id, riderMemberId: row.rider_member_id,
     createdByUserId: row.created_by_user_id, distanceM: row.distance_m,
     efficiencyMPerLitre: row.efficiency_m_per_litre, consumedMl: row.consumed_ml,
+    presetId: row.preset_id ?? null, presetLabel: row.preset_label ?? null,
     occurredAt: row.occurred_at, createdAt: row.created_at, updatedAt: row.updated_at,
     deletedAt: row.deleted_at, note: row.note,
+  };
+}
+
+function presetFromRow(row: RidePresetRow): RidePreset {
+  return {
+    id: row.id, groupId: row.group_id, memberId: row.member_id, label: row.label,
+    distanceM: row.distance_m, isPinned: row.is_pinned, displayOrder: row.display_order,
+    lastUsedAt: row.last_used_at, usageCount: row.usage_count,
+    createdAt: row.created_at, updatedAt: row.updated_at,
   };
 }
 
@@ -281,6 +322,7 @@ function localGroupData(groupId: string): GroupData | null {
     purchases: database.purchases.filter((item) => item.groupId === groupId),
     rides: database.rides.filter((item) => item.groupId === groupId),
     payments: database.payments.filter((item) => item.groupId === groupId),
+    presets: database.presets.filter((item) => item.groupId === groupId && item.memberId === currentMember.id),
     revisions: database.revisions.filter((item) => item.groupId === groupId),
     currentUserId: userId,
     currentMemberId: currentMember.id,
@@ -306,15 +348,16 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
   }
   await flushPendingActions(selectedGroupId);
 
-  const [groupResult, membersResult, fuelResult, ridesResult, paymentsResult, revisionsResult] = await Promise.all([
+  const [groupResult, membersResult, fuelResult, ridesResult, paymentsResult, revisionsResult, presetsResult] = await Promise.all([
     supabase.from("groups").select("*").eq("id", selectedGroupId).maybeSingle(),
     supabase.from("members").select("*").eq("group_id", selectedGroupId).order("created_at"),
     supabase.from("fuel_purchases").select("*").eq("group_id", selectedGroupId),
     supabase.from("rides").select("*").eq("group_id", selectedGroupId),
     supabase.from("payments").select("*").eq("group_id", selectedGroupId),
     supabase.from("event_revisions").select("*").eq("group_id", selectedGroupId).order("created_at", { ascending: false }),
+    supabase.from("ride_presets").select("*").eq("group_id", selectedGroupId).order("display_order"),
   ]);
-  const error = groupResult.error ?? membersResult.error ?? fuelResult.error ?? ridesResult.error ?? paymentsResult.error ?? revisionsResult.error;
+  const error = groupResult.error ?? membersResult.error ?? fuelResult.error ?? ridesResult.error ?? paymentsResult.error ?? revisionsResult.error ?? presetsResult.error;
   if (error) throw new Error(error.message);
   if (!groupResult.data) {
     forgetActiveGroup();
@@ -329,9 +372,10 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
   const rides = (ridesResult.data as unknown as RideRow[]).map(rideFromRow);
   const payments = (paymentsResult.data as unknown as PaymentRow[]).map(paymentFromRow);
   for (const action of pending) {
-    if (action.event.kind === "fuel_purchase" && !purchases.some((entry) => entry.id === action.event.id)) purchases.push(action.event);
-    if (action.event.kind === "ride" && !rides.some((entry) => entry.id === action.event.id)) rides.push(action.event);
-    if (action.event.kind === "payment" && !payments.some((entry) => entry.id === action.event.id)) payments.push(action.event);
+    const collection: LedgerEvent[] = action.event.kind === "fuel_purchase" ? purchases : action.event.kind === "ride" ? rides : payments;
+    const index = collection.findIndex((entry) => entry.id === action.event.id);
+    if (index >= 0) collection[index] = action.event;
+    else collection.push(action.event);
   }
   return {
     group: groupFromRow(groupResult.data as unknown as GroupRow),
@@ -339,10 +383,11 @@ async function cloudGroupData(groupId?: string | null): Promise<GroupData | null
     purchases,
     rides,
     payments,
+    presets: (presetsResult.data as unknown as RidePresetRow[]).map(presetFromRow),
     revisions: (revisionsResult.data as unknown as RevisionRow[]).map(revisionFromRow),
     currentUserId: userId,
     currentMemberId: currentMember.id,
-    pendingEventIds: pending.map((action) => action.event.id),
+    pendingEventIds: [...new Set(pending.map((action) => action.event.id))],
     mode: "cloud",
   };
 }
@@ -446,7 +491,7 @@ function validateLocal(database: LocalDatabase, groupId: string): void {
   if (result.issues[0]) throw new Error(result.issues[0].message);
 }
 
-export async function addRide(data: GroupData, input: CreateRideInput): Promise<void> {
+export async function addRide(data: GroupData, input: CreateRideInput): Promise<RideSaveResult> {
   const distanceM = Math.round(input.distanceKm * 1000);
   const consumedMl = fuelForRide(input.distanceKm, data.group.mileageMPerLitre / 1000);
   const now = new Date().toISOString();
@@ -454,13 +499,206 @@ export async function addRide(data: GroupData, input: CreateRideInput): Promise<
     id: crypto.randomUUID(), kind: "ride", groupId: data.group.id, riderMemberId: data.currentMemberId,
     createdByUserId: data.currentUserId, distanceM, efficiencyMPerLitre: data.group.mileageMPerLitre,
     consumedMl, occurredAt: input.occurredAt, createdAt: now, updatedAt: now, deletedAt: null, note: input.note?.trim() ?? "",
+    presetId: input.presetId ?? null, presetLabel: input.presetLabel?.trim() || null,
   };
   if (data.mode === "cloud") {
-    await insertOrQueueCloudEvent(event);
-    return;
+    return { ride: event, pendingSync: await insertOrQueueCloudEvent(event) };
   }
   const database = loadLocalDatabase();
   database.rides.push(event);
+  validateLocal(database, data.group.id);
+  saveLocalDatabase(database);
+  return { ride: event, pendingSync: false };
+}
+
+function normalizedPresetInput(input: CreateRidePresetInput): { label: string; distanceM: number; isPinned: boolean } {
+  const label = input.label.trim();
+  const distanceM = Math.round(input.distanceKm * 1000);
+  if (label.length < 1 || label.length > 32) throw new Error("Preset labels must be between 1 and 32 characters.");
+  if (distanceM < 100 || distanceM > 200_000) throw new Error("Preset distance must be between 0.1 and 200 km.");
+  return { label, distanceM, isPinned: input.isPinned };
+}
+
+function assertPresetOwner(data: GroupData, preset: RidePreset): void {
+  if (preset.groupId !== data.group.id || preset.memberId !== data.currentMemberId) {
+    throw new Error("You can only manage your own quick rides.");
+  }
+}
+
+function assertUniquePresetLabel(data: GroupData, label: string, excludedId?: string): void {
+  const normalized = label.toLowerCase();
+  if (data.presets.some((preset) => preset.id !== excludedId && preset.label.trim().toLowerCase() === normalized)) {
+    throw new Error("You already have a quick ride with that label.");
+  }
+}
+
+export function dashboardRidePresets(presets: RidePreset[]): RidePreset[] {
+  return presets
+    .filter((preset) => preset.isPinned)
+    .sort((a, b) => a.displayOrder - b.displayOrder || a.createdAt.localeCompare(b.createdAt))
+    .slice(0, 4);
+}
+
+export async function createRidePreset(data: GroupData, input: CreateRidePresetInput): Promise<RidePreset> {
+  const normalized = normalizedPresetInput(input);
+  if (data.presets.length >= 6) throw new Error("You can have up to 6 quick rides.");
+  assertUniquePresetLabel(data, normalized.label);
+  const now = new Date().toISOString();
+  const preset: RidePreset = {
+    id: crypto.randomUUID(), groupId: data.group.id, memberId: data.currentMemberId,
+    label: normalized.label, distanceM: normalized.distanceM, isPinned: normalized.isPinned,
+    displayOrder: data.presets.reduce((highest, entry) => Math.max(highest, entry.displayOrder), -1) + 1,
+    lastUsedAt: null, usageCount: 0, createdAt: now, updatedAt: now,
+  };
+  if (data.mode === "cloud") {
+    const { error } = await getSupabase().from("ride_presets").insert({
+      id: preset.id, group_id: preset.groupId, member_id: preset.memberId, label: preset.label,
+      distance_m: preset.distanceM, is_pinned: preset.isPinned, display_order: preset.displayOrder,
+    });
+    if (error) {
+      if (error.code === "23505") throw new Error("You already have a quick ride with that label.");
+      throw new Error(error.message);
+    }
+    return preset;
+  }
+  const database = loadLocalDatabase();
+  const memberPresets = database.presets.filter((entry) => entry.groupId === data.group.id && entry.memberId === data.currentMemberId);
+  if (memberPresets.length >= 6) throw new Error("You can have up to 6 quick rides.");
+  if (memberPresets.some((entry) => entry.label.trim().toLowerCase() === preset.label.toLowerCase())) {
+    throw new Error("You already have a quick ride with that label.");
+  }
+  database.presets.push(preset);
+  saveLocalDatabase(database);
+  return preset;
+}
+
+export async function updateRidePreset(data: GroupData, preset: RidePreset, input: UpdateRidePresetInput): Promise<void> {
+  assertPresetOwner(data, preset);
+  const normalized = normalizedPresetInput(input);
+  assertUniquePresetLabel(data, normalized.label, preset.id);
+  if (data.mode === "cloud") {
+    const { error } = await getSupabase().from("ride_presets").update({
+      label: normalized.label, distance_m: normalized.distanceM, is_pinned: normalized.isPinned,
+    }).eq("id", preset.id);
+    if (error) {
+      if (error.code === "23505") throw new Error("You already have a quick ride with that label.");
+      throw new Error(error.message);
+    }
+    return;
+  }
+  const database = loadLocalDatabase();
+  const stored = database.presets.find((entry) => entry.id === preset.id && entry.memberId === data.currentMemberId);
+  if (!stored) throw new Error("Quick ride not found.");
+  if (database.presets.some((entry) => entry.groupId === data.group.id && entry.memberId === data.currentMemberId && entry.id !== preset.id && entry.label.trim().toLowerCase() === normalized.label.toLowerCase())) {
+    throw new Error("You already have a quick ride with that label.");
+  }
+  Object.assign(stored, { label: normalized.label, distanceM: normalized.distanceM, isPinned: normalized.isPinned, updatedAt: new Date().toISOString() });
+  saveLocalDatabase(database);
+}
+
+export async function deleteRidePreset(data: GroupData, preset: RidePreset): Promise<void> {
+  assertPresetOwner(data, preset);
+  if (data.mode === "cloud") {
+    const { error } = await getSupabase().from("ride_presets").delete().eq("id", preset.id);
+    if (error) throw new Error(error.message);
+    return;
+  }
+  const database = loadLocalDatabase();
+  database.presets = database.presets.filter((entry) => entry.id !== preset.id);
+  for (const ride of database.rides) {
+    if (ride.presetId === preset.id) ride.presetId = null;
+  }
+  saveLocalDatabase(database);
+}
+
+export async function moveRidePreset(data: GroupData, preset: RidePreset, direction: "up" | "down"): Promise<void> {
+  assertPresetOwner(data, preset);
+  const ordered = [...data.presets].sort((a, b) => a.displayOrder - b.displayOrder || a.createdAt.localeCompare(b.createdAt));
+  const index = ordered.findIndex((entry) => entry.id === preset.id);
+  const targetIndex = direction === "up" ? index - 1 : index + 1;
+  const target = ordered[targetIndex];
+  if (index < 0 || !target) return;
+  if (data.mode === "cloud") {
+    const supabase = getSupabase();
+    const first = await supabase.from("ride_presets").update({ display_order: target.displayOrder }).eq("id", preset.id);
+    if (first.error) throw new Error(first.error.message);
+    const second = await supabase.from("ride_presets").update({ display_order: preset.displayOrder }).eq("id", target.id);
+    if (second.error) throw new Error(second.error.message);
+    return;
+  }
+  const database = loadLocalDatabase();
+  const storedPreset = database.presets.find((entry) => entry.id === preset.id);
+  const storedTarget = database.presets.find((entry) => entry.id === target.id);
+  if (!storedPreset || !storedTarget) throw new Error("Quick ride not found.");
+  [storedPreset.displayOrder, storedTarget.displayOrder] = [storedTarget.displayOrder, storedPreset.displayOrder];
+  storedPreset.updatedAt = new Date().toISOString();
+  storedTarget.updatedAt = storedPreset.updatedAt;
+  saveLocalDatabase(database);
+}
+
+async function markRidePresetUsed(data: GroupData, preset: RidePreset, usedAt: string): Promise<void> {
+  if (data.mode === "cloud") {
+    if (!navigator.onLine) return;
+    const { error } = await getSupabase().from("ride_presets").update({
+      last_used_at: usedAt, usage_count: preset.usageCount + 1,
+    }).eq("id", preset.id);
+    if (error && !isConnectivityError(error.message)) throw new Error(error.message);
+    return;
+  }
+  const database = loadLocalDatabase();
+  const stored = database.presets.find((entry) => entry.id === preset.id);
+  if (!stored) return;
+  stored.lastUsedAt = usedAt;
+  stored.usageCount += 1;
+  stored.updatedAt = new Date().toISOString();
+  saveLocalDatabase(database);
+}
+
+export async function logRideFromPreset(data: GroupData, preset: RidePreset): Promise<RideSaveResult> {
+  assertPresetOwner(data, preset);
+  const occurredAt = new Date().toISOString();
+  const result = await addRide(data, {
+    distanceKm: preset.distanceM / 1000,
+    occurredAt,
+    presetId: preset.id,
+    presetLabel: preset.label,
+  });
+  try {
+    await markRidePresetUsed(data, preset, occurredAt);
+  } catch {
+    // The ride is the source of truth. Usage metadata must never make a
+    // successfully recorded ride look failed and encourage a duplicate tap.
+  }
+  return result;
+}
+
+export async function voidRide(data: GroupData, ride: Ride): Promise<void> {
+  if (ride.createdByUserId !== data.currentUserId) throw new Error("You can only undo rides that you recorded.");
+  if (ride.deletedAt) return;
+  const now = new Date().toISOString();
+  const deletedRide: Ride = { ...ride, deletedAt: now, updatedAt: now };
+  if (data.mode === "cloud") {
+    const hasPendingInsert = loadPendingActions().some((action) => action.event.id === ride.id && (action.operation ?? "insert") === "insert");
+    if (!navigator.onLine || hasPendingInsert) {
+      queueCloudUpdate(deletedRide);
+      return;
+    }
+    const error = await updateCloudEvent(deletedRide);
+    if (!error) return;
+    if (isConnectivityError(error.message)) {
+      queueCloudUpdate(deletedRide);
+      return;
+    }
+    throw new Error(error.message ?? "Could not undo this ride.");
+  }
+  const database = loadLocalDatabase();
+  const stored = database.rides.find((entry) => entry.id === ride.id);
+  if (!stored) throw new Error("Ride not found.");
+  database.revisions.unshift({
+    id: crypto.randomUUID(), groupId: data.group.id, entityType: "ride", entityId: ride.id,
+    changedByUserId: data.currentUserId, previousData: { ...stored }, createdAt: now,
+  });
+  Object.assign(stored, deletedRide);
   validateLocal(database, data.group.id);
   saveLocalDatabase(database);
 }
@@ -588,6 +826,7 @@ export function subscribeToGroup(groupId: string, onChange: () => void): () => v
     .on("postgres_changes", { event: "*", schema: "public", table: "fuel_purchases", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "rides", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "payments", filter: `group_id=eq.${groupId}` }, onChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "ride_presets", filter: `group_id=eq.${groupId}` }, onChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "members", filter: `group_id=eq.${groupId}` }, onChange)
     .subscribe();
   return () => { void supabase.removeChannel(channel); };

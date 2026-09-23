@@ -5,6 +5,8 @@ import {
   ArrowUpRight,
   Bike,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Droplets,
   Fuel,
@@ -13,6 +15,7 @@ import {
   Pencil,
   Plus,
   Settings,
+  Trash2,
   Users,
   X,
 } from "lucide-react";
@@ -23,15 +26,22 @@ import {
   addFuel,
   addPayment,
   addRide,
+  createRidePreset,
   createGroup,
+  dashboardRidePresets,
+  deleteRidePreset,
   joinGroup,
   loadCurrentGroup,
+  logRideFromPreset,
+  moveRidePreset,
   subscribeToGroup,
   updateEvent,
   updateGroupSettings,
+  updateRidePreset,
+  voidRide,
 } from "@/lib/repository";
 import { isCloudConfigured } from "@/lib/supabase";
-import type { EventKind, GroupData, LedgerEvent, PaymentMethod, SuggestedTransfer } from "@/lib/types";
+import type { EventKind, GroupData, LedgerEvent, PaymentMethod, Ride, RidePreset, SuggestedTransfer } from "@/lib/types";
 
 type ModalState =
   | { type: "ride" }
@@ -39,6 +49,7 @@ type ModalState =
   | { type: "payment"; transfer?: SuggestedTransfer }
   | { type: "edit"; event: LedgerEvent }
   | { type: "settings" }
+  | { type: "presets" }
   | null;
 
 function memberName(data: GroupData, memberId: string): string {
@@ -161,7 +172,7 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   );
 }
 
-function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalState, null | { type: "settings" }>; data: GroupData; onSaved: () => Promise<void>; onClose: () => void }) {
+function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalState, null | { type: "settings" } | { type: "presets" }>; data: GroupData; onSaved: () => Promise<void>; onClose: () => void }) {
   const editing = state.type === "edit" ? state.event : null;
   let kind: EventKind;
   if (state.type === "edit") kind = state.event.kind;
@@ -170,6 +181,7 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
   const transfer = state.type === "payment" ? state.transfer : undefined;
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [saveAsPreset, setSaveAsPreset] = useState(false);
 
   const title = editing ? "Correct entry" : kind === "ride" ? "Log a ride" : kind === "fuel_purchase" ? "Log a refill" : "Record a repayment";
 
@@ -193,7 +205,22 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           note: String(form.get("note") ?? ""),
         });
       } else if (kind === "ride") {
-        await addRide(data, { distanceKm: Number(form.get("distance")), occurredAt, note: String(form.get("note") ?? "") });
+        let createdPreset: RidePreset | null = null;
+        if (saveAsPreset) {
+          createdPreset = await createRidePreset(data, {
+            label: String(form.get("presetLabel") ?? ""),
+            distanceKm: Number(form.get("distance")),
+            isPinned: true,
+          });
+        }
+        try {
+          await addRide(data, { distanceKm: Number(form.get("distance")), occurredAt, note: String(form.get("note") ?? "") });
+        } catch (caught) {
+          if (createdPreset) {
+            try { await deleteRidePreset(data, createdPreset); } catch { /* Preserve the ride error shown to the member. */ }
+          }
+          throw caught;
+        }
       } else if (kind === "fuel_purchase") {
         await addFuel(data, { amountRupees: Number(form.get("amount")), pricePerLitre: Number(form.get("price")), isFullTank: form.get("isFullTank") === "on", occurredAt, note: String(form.get("note") ?? "") });
       } else {
@@ -220,6 +247,12 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           <>
             <div className="identity-line"><Bike /><span>{memberName(data, data.currentMemberId)} is riding</span></div>
             <label>Distance travelled (km)<input name="distance" required autoFocus type="number" min="0.1" max="1000" step="0.1" defaultValue={editing?.kind === "ride" ? editing.distanceM / 1000 : ""} placeholder="12.5" /></label>
+            {!editing && (
+              <>
+                <label className="check-field"><input name="saveAsPreset" type="checkbox" checked={saveAsPreset} onChange={(event) => setSaveAsPreset(event.currentTarget.checked)} /><span><strong>Save as quick ride</strong><small>Add this distance to your personal one-tap shortcuts.</small></span></label>
+                {saveAsPreset && <label>Preset label<input name="presetLabel" required minLength={1} maxLength={32} placeholder="e.g. College" /></label>}
+              </>
+            )}
           </>
         )}
         {kind === "fuel_purchase" && (
@@ -251,6 +284,91 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
         {error && <ErrorMessage message={error} />}
         <button className="primary-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save correction" : "Save"}</button>
       </form>
+    </Modal>
+  );
+}
+
+function PresetManager({ data, onSaved, onClose }: { data: GroupData; onSaved: () => Promise<void>; onClose: () => void }) {
+  const [editing, setEditing] = useState<RidePreset | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const ordered = [...data.presets].sort((a, b) => a.displayOrder - b.displayOrder || a.createdAt.localeCompare(b.createdAt));
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const form = new FormData(event.currentTarget);
+    const input = {
+      label: String(form.get("label") ?? ""),
+      distanceKm: Number(form.get("distance")),
+      isPinned: form.get("isPinned") === "on",
+    };
+    try {
+      if (editing) await updateRidePreset(data, editing, input);
+      else await createRidePreset(data, input);
+      setEditing(null);
+      await onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save this quick ride.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(preset: RidePreset) {
+    if (!window.confirm(`Delete ${preset.label}? Earlier rides will stay in your history.`)) return;
+    setError("");
+    try {
+      await deleteRidePreset(data, preset);
+      if (editing?.id === preset.id) setEditing(null);
+      await onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete this quick ride.");
+    }
+  }
+
+  async function move(preset: RidePreset, direction: "up" | "down") {
+    setError("");
+    try {
+      await moveRidePreset(data, preset, direction);
+      await onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not reorder quick rides.");
+    }
+  }
+
+  return (
+    <Modal title="Manage quick rides" onClose={onClose}>
+      {ordered.length > 0 && (
+        <div className="preset-list">
+          {ordered.map((preset, index) => (
+            <article className="preset-row" key={preset.id}>
+              <div><strong>{preset.label}</strong><small>{formatDistance(preset.distanceM)}{preset.isPinned ? " · Pinned" : ""}</small></div>
+              <div className="preset-row-actions">
+                <button className="icon-button small" onClick={() => void move(preset, "up")} disabled={index === 0} aria-label={`Move ${preset.label} up`}><ChevronUp /></button>
+                <button className="icon-button small" onClick={() => void move(preset, "down")} disabled={index === ordered.length - 1} aria-label={`Move ${preset.label} down`}><ChevronDown /></button>
+                <button className="icon-button small" onClick={() => setEditing(preset)} aria-label={`Edit ${preset.label}`}><Pencil /></button>
+                <button className="icon-button small danger-button" onClick={() => void remove(preset)} aria-label={`Delete ${preset.label}`}><Trash2 /></button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+      {!editing && ordered.length >= 6 ? <p className="field-help">You have reached the limit of 6 quick rides.</p> : (
+        <form className="entry-form preset-form" key={editing?.id ?? "new"} onSubmit={submit}>
+          <h3>{editing ? `Edit ${editing.label}` : "Add a preset"}</h3>
+          <label>Label<input name="label" required minLength={1} maxLength={32} defaultValue={editing?.label ?? ""} placeholder="e.g. College" /></label>
+          <label>Distance (km)<input name="distance" required type="number" min="0.1" max="200" step="0.1" defaultValue={editing ? editing.distanceM / 1000 : ""} placeholder="8" /></label>
+          <label className="check-field"><input name="isPinned" type="checkbox" defaultChecked={editing?.isPinned ?? true} /><span><strong>Pin to dashboard</strong><small>The dashboard shows your first four pinned quick rides.</small></span></label>
+          {error && <ErrorMessage message={error} />}
+          <div className="form-actions">
+            {editing && <button className="secondary-button" type="button" onClick={() => setEditing(null)}>Cancel</button>}
+            <button className="primary-button" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : "Add preset"}</button>
+          </div>
+        </form>
+      )}
+      {error && !editing && ordered.length >= 6 && <ErrorMessage message={error} />}
     </Modal>
   );
 }
@@ -294,14 +412,33 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"home" | "activity" | "people">("home");
   const [openRevisionId, setOpenRevisionId] = useState<string | null>(null);
-  const snapshot = useMemo(() => calculateLedger(data.group, data.members, data.purchases, data.rides, data.payments), [data]);
+  const [optimisticRides, setOptimisticRides] = useState<Ride[]>([]);
+  const [quickBusyId, setQuickBusyId] = useState<string | null>(null);
+  const [quickError, setQuickError] = useState("");
+  const [toast, setToast] = useState<{ ride: Ride; label: string; pendingSync: boolean } | null>(null);
+  const effectiveRides = useMemo(() => [
+    ...data.rides,
+    ...optimisticRides.filter((ride) => !data.rides.some((stored) => stored.id === ride.id)),
+  ], [data.rides, optimisticRides]);
+  const pendingEventIds = useMemo(() => [...new Set([
+    ...data.pendingEventIds,
+    ...optimisticRides.filter((ride) => typeof navigator !== "undefined" && !navigator.onLine && !ride.deletedAt).map((ride) => ride.id),
+  ])], [data.pendingEventIds, optimisticRides]);
+  const snapshot = useMemo(() => calculateLedger(data.group, data.members, data.purchases, effectiveRides, data.payments), [data, effectiveRides]);
   const currentMember = data.members.find((member) => member.id === data.currentMemberId);
-  const activities = useMemo(() => ([...data.purchases, ...data.rides, ...data.payments] as LedgerEvent[])
+  const activities = useMemo(() => ([...data.purchases, ...effectiveRides, ...data.payments] as LedgerEvent[])
     .filter((event) => !event.deletedAt)
-    .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)), [data]);
+    .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)), [data.purchases, data.payments, effectiveRides]);
+  const quickRides = useMemo(() => dashboardRidePresets(data.presets), [data.presets]);
   const inviteUrl = typeof window === "undefined" ? "" : `${window.location.origin}/join/${data.group.inviteCode}`;
   const latestCalibration = snapshot.calibrations.at(-1);
   const calibrationByEventId = new Map(snapshot.calibrations.map((calibration) => [calibration.eventId, calibration]));
+
+  useEffect(() => {
+    if (!toast) return;
+    const timeout = window.setTimeout(() => setToast(null), 12_000);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
 
   function signedLitres(millilitres: number): string {
     return `${millilitres >= 0 ? "+" : "−"}${formatLitres(Math.abs(millilitres))}`;
@@ -311,6 +448,35 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
     await navigator.clipboard.writeText(inviteUrl);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1800);
+  }
+
+  async function logQuickRide(preset: RidePreset) {
+    setQuickBusyId(preset.id);
+    setQuickError("");
+    try {
+      const result = await logRideFromPreset(data, preset);
+      setOptimisticRides((rides) => [...rides.filter((ride) => ride.id !== result.ride.id), result.ride]);
+      setToast({ ride: result.ride, label: preset.label, pendingSync: result.pendingSync });
+      if (!result.pendingSync) await onRefresh();
+    } catch (caught) {
+      setQuickError(caught instanceof Error ? caught.message : "Could not add this ride.");
+    } finally {
+      setQuickBusyId(null);
+    }
+  }
+
+  async function undoQuickRide() {
+    if (!toast) return;
+    setQuickError("");
+    try {
+      await voidRide(data, toast.ride);
+      const deletedAt = new Date().toISOString();
+      setOptimisticRides((rides) => rides.map((ride) => ride.id === toast.ride.id ? { ...ride, deletedAt } : ride));
+      setToast(null);
+      if (!toast.pendingSync) await onRefresh();
+    } catch (caught) {
+      setQuickError(caught instanceof Error ? caught.message : "Could not undo this ride.");
+    }
   }
 
   function eventSummary(event: LedgerEvent): { icon: React.ReactNode; title: string; detail: string; amount?: string } {
@@ -325,7 +491,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
       };
     }
     if (event.kind === "ride") return {
-      icon: <Bike />, title: `${memberName(data, event.riderMemberId)} rode`,
+      icon: <Bike />, title: `${memberName(data, event.riderMemberId)} rode${event.presetLabel ? ` ${event.presetLabel}` : ""}`,
       detail: `${formatLitres(event.consumedMl)} estimated use`, amount: formatDistance(event.distanceM),
     };
     return {
@@ -352,7 +518,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
       </header>
 
       {data.mode === "local" && <div className="local-banner"><span>Local preview — connect Supabase to sync six phones.</span></div>}
-      {data.pendingEventIds.length > 0 && <div className="pending-banner"><span>{data.pendingEventIds.length} offline entr{data.pendingEventIds.length === 1 ? "y is" : "ies are"} waiting to sync.</span></div>}
+      {pendingEventIds.length > 0 && <div className="pending-banner"><span>{pendingEventIds.length} offline entr{pendingEventIds.length === 1 ? "y is" : "ies are"} waiting to sync.</span></div>}
 
       {tab === "home" && (
         <>
@@ -382,6 +548,19 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
           <section className="quick-actions" aria-label="Quick actions">
             <button className="action ride-action" onClick={() => setModal({ type: "ride" })}><span><Bike /></span><b>Log ride</b><small>Just enter kilometres</small></button>
             <button className="action fuel-action" onClick={() => setModal({ type: "fuel" })}><span><Fuel /></span><b>Add petrol</b><small>Amount and price/L</small></button>
+          </section>
+
+          <section className="quick-rides-section" aria-labelledby="quick-rides-title">
+            <div className="quick-rides-heading"><h2 id="quick-rides-title">Quick rides</h2><button className="text-button" onClick={() => setModal({ type: "presets" })}>Manage quick rides</button></div>
+            {data.presets.length === 0 ? (
+              <div className="quick-rides-empty"><p>Add common routes to log rides in one tap.</p><button className="secondary-button" onClick={() => setModal({ type: "presets" })}><Plus /> Add preset</button></div>
+            ) : (
+              <div className="quick-ride-buttons">
+                {quickRides.map((preset) => <button key={preset.id} disabled={quickBusyId !== null} onClick={() => void logQuickRide(preset)}>{quickBusyId === preset.id ? "Adding…" : <><strong>{preset.label}</strong><span>· {formatDistance(preset.distanceM)}</span></>}</button>)}
+                <button className="add-preset-button" onClick={() => setModal({ type: "presets" })}><Plus /> Add</button>
+              </div>
+            )}
+            {quickError && <ErrorMessage message={quickError} />}
           </section>
 
           <section className="section-block">
@@ -425,7 +604,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
                 <div className="activity-entry" key={event.id}>
                   <article className="activity-row">
                     <span className="activity-icon">{summary.icon}</span>
-                    <div className="activity-main"><strong>{summary.title}</strong><small>{summary.detail} · {new Date(event.occurredAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>{data.pendingEventIds.includes(event.id) && <em className="pending-label">Pending sync</em>}{revisionCount > 0 && <button className="revision-link" onClick={() => setOpenRevisionId(openRevisionId === event.id ? null : event.id)}>{revisionCount} correction{revisionCount > 1 ? "s" : ""} recorded</button>}</div>
+                    <div className="activity-main"><strong>{summary.title}</strong><small>{summary.detail} · {new Date(event.occurredAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>{pendingEventIds.includes(event.id) && <em className="pending-label">Pending sync</em>}{revisionCount > 0 && <button className="revision-link" onClick={() => setOpenRevisionId(openRevisionId === event.id ? null : event.id)}>{revisionCount} correction{revisionCount > 1 ? "s" : ""} recorded</button>}</div>
                     <b>{summary.amount}</b>
                     {event.createdByUserId === data.currentUserId && <button className="icon-button small" onClick={() => setModal({ type: "edit", event })} aria-label={`Correct ${summary.title}`}><Pencil /></button>}
                   </article>
@@ -472,8 +651,11 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
         <button className={tab === "people" ? "active" : ""} onClick={() => setTab("people")}><Users /><span>People</span></button>
       </nav>
 
-      {modal && modal.type !== "settings" && <EntryModal state={modal} data={data} onSaved={onRefresh} onClose={() => setModal(null)} />}
+      {toast && <div className="ride-toast" role="status"><span><strong>{toast.label} ride added</strong>{toast.pendingSync && <small>Pending sync</small>}</span><button onClick={() => void undoQuickRide()}>Undo</button></div>}
+
+      {modal && modal.type !== "settings" && modal.type !== "presets" && <EntryModal state={modal} data={data} onSaved={onRefresh} onClose={() => setModal(null)} />}
       {modal?.type === "settings" && <SettingsModal data={data} onSaved={onRefresh} onClose={() => setModal(null)} />}
+      {modal?.type === "presets" && <PresetManager data={data} onSaved={onRefresh} onClose={() => setModal(null)} />}
     </main>
   );
 }

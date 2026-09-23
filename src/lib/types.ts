@@ -48,6 +48,22 @@ export interface Ride extends BaseEvent {
   distanceM: number;
   efficiencyMPerLitre: number;
   consumedMl: number;
+  presetId: string | null;
+  presetLabel: string | null;
+}
+
+export interface RidePreset {
+  id: string;
+  groupId: string;
+  memberId: string;
+  label: string;
+  distanceM: number;
+  isPinned: boolean;
+  displayOrder: number;
+  lastUsedAt: string | null;
+  usageCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SettlementPayment extends BaseEvent {
@@ -124,6 +140,7 @@ export interface GroupData {
   purchases: FuelPurchase[];
   rides: Ride[];
   payments: SettlementPayment[];
+  presets: RidePreset[];
   revisions: EventRevision[];
   currentUserId: string;
   currentMemberId: string;
@@ -145,6 +162,21 @@ export interface CreateRideInput {
   distanceKm: number;
   occurredAt: string;
   note?: string;
+  presetId?: string;
+  presetLabel?: string;
+}
+
+export interface CreateRidePresetInput {
+  label: string;
+  distanceKm: number;
+  isPinned: boolean;
+}
+
+export type UpdateRidePresetInput = CreateRidePresetInput;
+
+export interface RideSaveResult {
+  ride: Ride;
+  pendingSync: boolean;
 }
 
 export interface CreateFuelInput {

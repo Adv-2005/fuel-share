@@ -31,6 +31,7 @@ function ride(overrides: Partial<Ride> = {}): Ride {
   return {
     id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "bob", createdByUserId: "bob-user",
     distanceM: 45_000, efficiencyMPerLitre: 45_000, consumedMl: 1_000,
+    presetId: null, presetLabel: null,
     occurredAt: "2026-01-02T10:00:00.000Z", createdAt: group.createdAt, updatedAt: group.createdAt, deletedAt: null, note: "", ...overrides,
   };
 }
