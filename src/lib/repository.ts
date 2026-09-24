@@ -159,19 +159,36 @@ function saveLocalDatabase(database: LocalDatabase): void {
   window.localStorage.setItem(LOCAL_DATABASE_KEY, JSON.stringify(database));
 }
 
+function rideParticipantMemberIds(ride: Pick<Ride, "riderMemberId" | "participantMemberIds">): string[] {
+  return Array.isArray(ride.participantMemberIds) && ride.participantMemberIds.length > 0
+    ? ride.participantMemberIds
+    : [ride.riderMemberId];
+}
+
 function loadPendingActions(): PendingCloudAction[] {
   const raw = window.localStorage.getItem(PENDING_ACTIONS_KEY);
   if (!raw) return [];
   try {
     const stored = JSON.parse(raw) as Array<PendingCloudAction | LegacyPendingCloudUpdateAction>;
-    return stored.map((action) => {
-      if (action.operation !== "update" || "patch" in action) return action;
-      return {
-        event: { id: action.event.id, groupId: action.event.groupId, kind: action.event.kind },
-        operation: "update",
-        patch: { deletedAt: action.event.deletedAt, updatedAt: action.event.updatedAt },
-      };
+    let migrated = false;
+    const normalized = stored.map((action): PendingCloudAction => {
+      if (action.operation === "update") {
+        if ("patch" in action) return action;
+        migrated = true;
+        return {
+          event: { id: action.event.id, groupId: action.event.groupId, kind: action.event.kind },
+          operation: "update",
+          patch: { deletedAt: action.event.deletedAt, updatedAt: action.event.updatedAt },
+        };
+      }
+      if (action.event.kind !== "ride") return action;
+      const participantMemberIds = rideParticipantMemberIds(action.event);
+      if (participantMemberIds === action.event.participantMemberIds) return action;
+      migrated = true;
+      return { ...action, event: { ...action.event, participantMemberIds } };
     });
+    if (migrated) window.localStorage.setItem(PENDING_ACTIONS_KEY, JSON.stringify(normalized));
+    return normalized;
   } catch {
     return [];
   }
@@ -214,7 +231,7 @@ function cloudRecordFor(event: QueueableEvent): Record<string, string | number |
   };
   if (event.kind === "ride") return {
     ...base, rider_member_id: event.riderMemberId, distance_m: event.distanceM,
-    participant_member_ids: event.participantMemberIds,
+    participant_member_ids: rideParticipantMemberIds(event),
     efficiency_m_per_litre: event.efficiencyMPerLitre, consumed_ml: event.consumedMl,
     preset_id: event.presetId, preset_label: event.presetLabel,
   };
@@ -857,13 +874,18 @@ async function markRidePresetUsed(data: GroupData, preset: RidePreset, usedAt: s
   saveLocalDatabase(database);
 }
 
-export async function logRideFromPreset(data: GroupData, preset: RidePreset): Promise<RideSaveResult> {
+export async function logRideFromPreset(
+  data: GroupData,
+  preset: RidePreset,
+  input: Partial<Pick<CreateRideInput, "distanceKm" | "participantMemberIds" | "occurredAt" | "note">> = {},
+): Promise<RideSaveResult> {
   assertPresetOwner(data, preset);
-  const occurredAt = new Date().toISOString();
+  const occurredAt = input.occurredAt ?? new Date().toISOString();
   const result = await addRide(data, {
-    distanceKm: preset.distanceM / 1000,
-    participantMemberIds: [data.currentMemberId],
+    distanceKm: input.distanceKm ?? preset.distanceM / 1000,
+    participantMemberIds: input.participantMemberIds ?? [data.currentMemberId],
     occurredAt,
+    note: input.note,
     presetId: preset.id,
     presetLabel: preset.label,
   });

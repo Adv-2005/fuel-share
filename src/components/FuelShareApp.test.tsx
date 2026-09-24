@@ -352,6 +352,26 @@ describe("shared rides", () => {
     expect(screen.getByText("Who rode?")).toBeInTheDocument();
   });
 
+  it("records preset usage when logging a shared preset ride", async () => {
+    const college = preset();
+    const data = sharedData();
+    data.presets = [college];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    vi.mocked(logRideFromPreset).mockResolvedValue({ ride: sharedRide(), pendingSync: false });
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Log with people" }));
+    await user.click(screen.getByLabelText("Rahul"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(logRideFromPreset).toHaveBeenCalledWith(data, college, expect.objectContaining({
+      distanceKm: 8,
+      participantMemberIds: ["member", "rahul"],
+    }));
+    expect(addRide).not.toHaveBeenCalled();
+  });
+
   it("renders shared activity and participant distance without multiplying tank travel", async () => {
     const data = sharedData();
     data.rides = [sharedRide()];
@@ -364,6 +384,22 @@ describe("shared rides", () => {
     expect(screen.getByText("8 km")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "People" }));
     expect(screen.getAllByText(/8 km participated/)).toHaveLength(3);
+  });
+
+  it("renders legacy solo rides without a participant list", async () => {
+    const data = sharedData();
+    const legacyRide = { ...sharedRide() } as unknown as Record<string, unknown>;
+    delete legacyRide.participantMemberIds;
+    legacyRide.id = "legacy-ride";
+    legacyRide.riderMemberId = "member";
+    data.rides = [legacyRide as unknown as Ride];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    expect(screen.getByText("Aditya rode")).toBeInTheDocument();
+    expect(screen.getByText("8 km")).toBeInTheDocument();
   });
 
   it("allows correcting a shared ride back to solo", async () => {

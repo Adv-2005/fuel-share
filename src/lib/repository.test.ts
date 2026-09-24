@@ -120,6 +120,27 @@ describe("ride presets", () => {
     expect(loaded?.presets[0]).toMatchObject({ usageCount: 1, lastUsedAt: expect.any(String) });
   });
 
+  it("logs shared preset rides and records preset usage", async () => {
+    const college = preset();
+    const data = groupData({ presets: [college] });
+    seedLocal(data);
+
+    const { ride } = await logRideFromPreset(data, college, {
+      participantMemberIds: ["alice", "bob"],
+      occurredAt: "2026-01-02T00:00:00.000Z",
+      note: "Shared commute",
+    });
+
+    expect(ride).toMatchObject({
+      participantMemberIds: ["alice", "bob"],
+      occurredAt: "2026-01-02T00:00:00.000Z",
+      note: "Shared commute",
+      presetId: college.id,
+    });
+    const loaded = await loadCurrentGroup("group");
+    expect(loaded?.presets[0]).toMatchObject({ usageCount: 1, lastUsedAt: "2026-01-02T00:00:00.000Z" });
+  });
+
   it("soft deletes an undone ride and retains its prior state as a revision", async () => {
     const college = preset();
     const data = groupData({ presets: [college] });
@@ -308,6 +329,23 @@ describe("shared rides", () => {
     const pending = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{ event: Ride }>;
     expect(result.pendingSync).toBe(true);
     expect(pending[0].event.participantMemberIds).toEqual(["alice", "bob"]);
+  });
+
+  it("backfills the driver in legacy pending ride inserts", async () => {
+    vi.spyOn(window.navigator, "onLine", "get").mockReturnValue(false);
+    const legacyRide = { ...storedRide() } as unknown as Record<string, unknown>;
+    delete legacyRide.participantMemberIds;
+    localStorage.setItem("fuelshare_pending_actions_v1", JSON.stringify([{ operation: "insert", event: legacyRide }]));
+    const data = groupData({ mode: "cloud", members: sharedMembers });
+
+    await addRide(data, {
+      distanceKm: 8, participantMemberIds: ["alice", "bob"], occurredAt: "2026-01-03T00:00:00.000Z",
+    });
+
+    const pending = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{ event: Ride }>;
+    expect(pending).toHaveLength(2);
+    expect(pending[0].event.participantMemberIds).toEqual(["alice"]);
+    expect(pending[1].event.participantMemberIds).toEqual(["alice", "bob"]);
   });
 
   it("migrates legacy local rides to their original rider", async () => {

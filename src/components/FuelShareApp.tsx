@@ -266,14 +266,17 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           });
         }
         try {
-          await addRide(data, {
+          const rideInput = {
             distanceKm: Number(form.get("distance")),
             participantMemberIds,
             occurredAt,
             note: String(form.get("note") ?? ""),
-            presetId: state.type === "ride" ? state.preset?.id : undefined,
-            presetLabel: state.type === "ride" ? state.preset?.label : undefined,
-          });
+          };
+          if (state.type === "ride" && state.preset) {
+            await logRideFromPreset(data, state.preset, rideInput);
+          } else {
+            await addRide(data, rideInput);
+          }
         } catch (caught) {
           if (createdPreset) {
             try { await deleteRidePreset(data, createdPreset); } catch { /* Preserve the ride error shown to the member. */ }
@@ -655,7 +658,10 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
       };
     }
     if (event.kind === "ride") {
-      const passengerNames = event.participantMemberIds
+      const participantMemberIds = event.participantMemberIds?.length
+        ? event.participantMemberIds
+        : [event.riderMemberId];
+      const passengerNames = participantMemberIds
         .filter((memberId) => memberId !== event.riderMemberId)
         .map((memberId) => memberName(data, memberId));
       const passengerText = passengerNames.length === 0 ? ""
