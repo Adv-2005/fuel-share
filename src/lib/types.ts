@@ -62,6 +62,7 @@ export interface OpeningBalance extends BaseEvent {
 export interface Ride extends BaseEvent {
   kind: "ride";
   riderMemberId: string;
+  participantMemberIds: string[];
   distanceM: number;
   efficiencyMPerLitre: number;
   consumedMl: number;
@@ -194,6 +195,7 @@ export interface SaveOpeningBalanceInput {
 
 export interface CreateRideInput {
   distanceKm: number;
+  participantMemberIds: string[];
   occurredAt: string;
   note?: string;
   presetId?: string;

@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FuelShareApp } from "@/components/FuelShareApp";
-import { addFuel, createRidePreset, loadCurrentGroup, logRideFromPreset, updateRidePreset, voidRide } from "@/lib/repository";
+import { addFuel, addRide, createRidePreset, loadCurrentGroup, logRideFromPreset, updateEvent, updateRidePreset, voidRide } from "@/lib/repository";
 import type { GroupData, Ride, RidePreset } from "@/lib/types";
 
 vi.mock("@/lib/repository", () => ({
@@ -262,6 +262,7 @@ describe("quick rides", () => {
     const data = dashboardData([college]);
     const ride: Ride = {
       id: "quick-ride", kind: "ride", groupId: "group", riderMemberId: "member", createdByUserId: "user",
+      participantMemberIds: ["member"],
       distanceM: 8_000, efficiencyMPerLitre: 45_000, consumedMl: 178, presetId: college.id, presetLabel: college.label,
       occurredAt: timestamp, createdAt: timestamp, updatedAt: timestamp, deletedAt: null, note: "",
     };
@@ -290,5 +291,130 @@ describe("quick rides", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(createRidePreset).toHaveBeenCalledWith(data, { label: "Market", distanceKm: 3.5, isPinned: true });
+  });
+});
+
+describe("shared rides", () => {
+  function sharedData(): GroupData {
+    const data = dashboardData();
+    data.members = [
+      ...data.members,
+      { id: "rahul", groupId: "group", userId: "rahul-user", displayName: "Rahul", role: "member", createdAt: timestamp },
+      { id: "aman", groupId: "group", userId: "aman-user", displayName: "Aman", role: "member", createdAt: timestamp },
+      { id: "riya", groupId: "group", userId: "riya-user", displayName: "Riya", role: "member", createdAt: timestamp },
+    ];
+    return data;
+  }
+
+  function sharedRide(): Ride {
+    return {
+      id: "shared-ride", kind: "ride", groupId: "group", riderMemberId: "member",
+      participantMemberIds: ["member", "rahul", "aman"], createdByUserId: "user", distanceM: 8_000,
+      efficiencyMPerLitre: 40_000, consumedMl: 200, presetId: null, presetLabel: null,
+      occurredAt: "2026-01-02T00:00:00.000Z", createdAt: timestamp, updatedAt: timestamp, deletedAt: null, note: "",
+    };
+  }
+
+  it("selects up to two additional riders and submits the locked driver", async () => {
+    const data = sharedData();
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: /Log ride/ }));
+    expect(screen.getByLabelText(/You \/ Driver/)).toBeChecked();
+    expect(screen.getByLabelText(/You \/ Driver/)).toBeDisabled();
+    await user.click(screen.getByLabelText("Rahul"));
+    await user.click(screen.getByLabelText("Aman"));
+    expect(screen.getByLabelText("Riya")).toBeDisabled();
+    expect(screen.getByText("Fuel cost will be split equally among 3 riders.")).toBeInTheDocument();
+    expect(screen.getByText(/maximum of three people/)).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Distance travelled (km)"), "8");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(addRide).toHaveBeenCalledWith(data, expect.objectContaining({
+      distanceKm: 8,
+      participantMemberIds: ["member", "rahul", "aman"],
+    }));
+  });
+
+  it("opens a preset in the shared ride form with its distance prefilled", async () => {
+    const college = preset();
+    const data = sharedData();
+    data.presets = [college];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Log with people" }));
+    expect(screen.getByRole("dialog", { name: "Log a ride" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Distance travelled (km)")).toHaveValue(8);
+    expect(screen.getByText("Who rode?")).toBeInTheDocument();
+  });
+
+  it("records preset usage when logging a shared preset ride", async () => {
+    const college = preset();
+    const data = sharedData();
+    data.presets = [college];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    vi.mocked(logRideFromPreset).mockResolvedValue({ ride: sharedRide(), pendingSync: false });
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Log with people" }));
+    await user.click(screen.getByLabelText("Rahul"));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(logRideFromPreset).toHaveBeenCalledWith(data, college, expect.objectContaining({
+      distanceKm: 8,
+      participantMemberIds: ["member", "rahul"],
+    }));
+    expect(addRide).not.toHaveBeenCalled();
+  });
+
+  it("renders shared activity and participant distance without multiplying tank travel", async () => {
+    const data = sharedData();
+    data.rides = [sharedRide()];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    expect(screen.getByText("Aditya rode with Rahul and Aman")).toBeInTheDocument();
+    expect(screen.getByText("8 km")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "People" }));
+    expect(screen.getAllByText(/8 km participated/)).toHaveLength(3);
+  });
+
+  it("renders legacy solo rides without a participant list", async () => {
+    const data = sharedData();
+    const legacyRide = { ...sharedRide() } as unknown as Record<string, unknown>;
+    delete legacyRide.participantMemberIds;
+    legacyRide.id = "legacy-ride";
+    legacyRide.riderMemberId = "member";
+    data.rides = [legacyRide as unknown as Ride];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    expect(screen.getByText("Aditya rode")).toBeInTheDocument();
+    expect(screen.getByText("8 km")).toBeInTheDocument();
+  });
+
+  it("allows correcting a shared ride back to solo", async () => {
+    const data = sharedData();
+    const ride = sharedRide();
+    data.rides = [ride];
+    vi.mocked(loadCurrentGroup).mockResolvedValue(data);
+    const user = userEvent.setup();
+    render(<FuelShareApp />);
+
+    await user.click(await screen.findByRole("button", { name: "Activity" }));
+    await user.click(screen.getByRole("button", { name: /Correct Aditya rode/ }));
+    await user.click(screen.getByLabelText("Rahul"));
+    await user.click(screen.getByLabelText("Aman"));
+    await user.click(screen.getByRole("button", { name: "Save correction" }));
+    expect(updateEvent).toHaveBeenCalledWith(data, ride, expect.objectContaining({ participantMemberIds: ["member"] }));
   });
 });

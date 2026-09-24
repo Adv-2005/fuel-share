@@ -110,6 +110,7 @@ interface OpeningOwnerRow {
 
 interface RideRow {
   id: string; group_id: string; rider_member_id: string; created_by_user_id: string;
+  participant_member_ids: string[];
   distance_m: number; efficiency_m_per_litre: number; consumed_ml: number;
   preset_id?: string | null; preset_label?: string | null;
   occurred_at: string; created_at: string; updated_at: string; deleted_at: string | null; note: string;
@@ -144,6 +145,10 @@ function loadLocalDatabase(): LocalDatabase {
     parsed.openingBalances ??= [];
     parsed.presets ??= [];
     parsed.groups = parsed.groups.map((group) => ({ ...group, setupStatus: group.setupStatus ?? "complete" }));
+    parsed.rides = parsed.rides.map((ride) => ({
+      ...ride,
+      participantMemberIds: ride.participantMemberIds?.length ? ride.participantMemberIds : [ride.riderMemberId],
+    }));
     return parsed;
   } catch {
     return emptyDatabase();
@@ -154,19 +159,36 @@ function saveLocalDatabase(database: LocalDatabase): void {
   window.localStorage.setItem(LOCAL_DATABASE_KEY, JSON.stringify(database));
 }
 
+function rideParticipantMemberIds(ride: Pick<Ride, "riderMemberId" | "participantMemberIds">): string[] {
+  return Array.isArray(ride.participantMemberIds) && ride.participantMemberIds.length > 0
+    ? ride.participantMemberIds
+    : [ride.riderMemberId];
+}
+
 function loadPendingActions(): PendingCloudAction[] {
   const raw = window.localStorage.getItem(PENDING_ACTIONS_KEY);
   if (!raw) return [];
   try {
     const stored = JSON.parse(raw) as Array<PendingCloudAction | LegacyPendingCloudUpdateAction>;
-    return stored.map((action) => {
-      if (action.operation !== "update" || "patch" in action) return action;
-      return {
-        event: { id: action.event.id, groupId: action.event.groupId, kind: action.event.kind },
-        operation: "update",
-        patch: { deletedAt: action.event.deletedAt, updatedAt: action.event.updatedAt },
-      };
+    let migrated = false;
+    const normalized = stored.map((action): PendingCloudAction => {
+      if (action.operation === "update") {
+        if ("patch" in action) return action;
+        migrated = true;
+        return {
+          event: { id: action.event.id, groupId: action.event.groupId, kind: action.event.kind },
+          operation: "update",
+          patch: { deletedAt: action.event.deletedAt, updatedAt: action.event.updatedAt },
+        };
+      }
+      if (action.event.kind !== "ride") return action;
+      const participantMemberIds = rideParticipantMemberIds(action.event);
+      if (participantMemberIds === action.event.participantMemberIds) return action;
+      migrated = true;
+      return { ...action, event: { ...action.event, participantMemberIds } };
     });
+    if (migrated) window.localStorage.setItem(PENDING_ACTIONS_KEY, JSON.stringify(normalized));
+    return normalized;
   } catch {
     return [];
   }
@@ -191,7 +213,7 @@ function queueCloudUpdate(event: CloudEventReference, patch: CloudEventPatch): v
   savePendingActions(actions);
 }
 
-function cloudRecordFor(event: QueueableEvent): Record<string, string | number | boolean | null> {
+function cloudRecordFor(event: QueueableEvent): Record<string, string | number | boolean | null | string[]> {
   const base = {
     id: event.id,
     group_id: event.groupId,
@@ -209,6 +231,7 @@ function cloudRecordFor(event: QueueableEvent): Record<string, string | number |
   };
   if (event.kind === "ride") return {
     ...base, rider_member_id: event.riderMemberId, distance_m: event.distanceM,
+    participant_member_ids: rideParticipantMemberIds(event),
     efficiency_m_per_litre: event.efficiencyMPerLitre, consumed_ml: event.consumedMl,
     preset_id: event.presetId, preset_label: event.presetLabel,
   };
@@ -337,6 +360,7 @@ function fuelFromRow(row: FuelRow): FuelPurchase {
 function rideFromRow(row: RideRow): Ride {
   return {
     id: row.id, kind: "ride", groupId: row.group_id, riderMemberId: row.rider_member_id,
+    participantMemberIds: row.participant_member_ids?.length ? row.participant_member_ids : [row.rider_member_id],
     createdByUserId: row.created_by_user_id, distanceM: row.distance_m,
     efficiencyMPerLitre: row.efficiency_m_per_litre, consumedMl: row.consumed_ml,
     presetId: row.preset_id ?? null, presetLabel: row.preset_label ?? null,
@@ -576,6 +600,10 @@ function validateLocal(database: LocalDatabase, groupId: string): void {
   if (activeOpenings[0] && firstNormalAt && activeOpenings[0].occurredAt > firstNormalAt) {
     throw new Error("The opening balance must occur before rides and refills.");
   }
+  const joinedMemberIds = database.members.filter((entry) => entry.groupId === groupId).map((entry) => entry.id);
+  for (const ride of database.rides.filter((entry) => entry.groupId === groupId)) {
+    validateRideParticipants(ride.riderMemberId, ride.participantMemberIds, joinedMemberIds);
+  }
   const result = calculateLedger(
     group,
     database.members.filter((entry) => entry.groupId === groupId),
@@ -585,6 +613,20 @@ function validateLocal(database: LocalDatabase, groupId: string): void {
     database.openingBalances.filter((entry) => entry.groupId === groupId),
   );
   if (result.issues[0]) throw new Error(result.issues[0].message);
+}
+
+export function validateRideParticipants(
+  driverMemberId: string,
+  participantMemberIds: string[],
+  joinedMemberIds: string[],
+): void {
+  if (participantMemberIds.length === 0) throw new Error("A ride must have at least one participant.");
+  if (new Set(participantMemberIds).size !== participantMemberIds.length) throw new Error("Ride participants must be unique.");
+  if (!participantMemberIds.includes(driverMemberId)) throw new Error("The driver must be included in the ride.");
+  if (participantMemberIds.length > 3) throw new Error("A ride can include at most three people.");
+  if (participantMemberIds.some((memberId) => !joinedMemberIds.includes(memberId))) {
+    throw new Error("Every ride participant must belong to this group.");
+  }
 }
 
 function assertSetupComplete(data: GroupData): void {
@@ -668,11 +710,13 @@ export async function saveOpeningBalance(data: GroupData, input: SaveOpeningBala
 
 export async function addRide(data: GroupData, input: CreateRideInput): Promise<RideSaveResult> {
   assertSetupComplete(data);
+  validateRideParticipants(data.currentMemberId, input.participantMemberIds, data.members.map((member) => member.id));
   const distanceM = Math.round(input.distanceKm * 1000);
   const consumedMl = fuelForRide(input.distanceKm, data.group.mileageMPerLitre / 1000);
   const now = new Date().toISOString();
   const event: Ride = {
     id: crypto.randomUUID(), kind: "ride", groupId: data.group.id, riderMemberId: data.currentMemberId,
+    participantMemberIds: [...input.participantMemberIds],
     createdByUserId: data.currentUserId, distanceM, efficiencyMPerLitre: data.group.mileageMPerLitre,
     consumedMl, occurredAt: input.occurredAt, createdAt: now, updatedAt: now, deletedAt: null, note: input.note?.trim() ?? "",
     presetId: input.presetId ?? null, presetLabel: input.presetLabel?.trim() || null,
@@ -830,12 +874,18 @@ async function markRidePresetUsed(data: GroupData, preset: RidePreset, usedAt: s
   saveLocalDatabase(database);
 }
 
-export async function logRideFromPreset(data: GroupData, preset: RidePreset): Promise<RideSaveResult> {
+export async function logRideFromPreset(
+  data: GroupData,
+  preset: RidePreset,
+  input: Partial<Pick<CreateRideInput, "distanceKm" | "participantMemberIds" | "occurredAt" | "note">> = {},
+): Promise<RideSaveResult> {
   assertPresetOwner(data, preset);
-  const occurredAt = new Date().toISOString();
+  const occurredAt = input.occurredAt ?? new Date().toISOString();
   const result = await addRide(data, {
-    distanceKm: preset.distanceM / 1000,
+    distanceKm: input.distanceKm ?? preset.distanceM / 1000,
+    participantMemberIds: input.participantMemberIds ?? [data.currentMemberId],
     occurredAt,
+    note: input.note,
     presetId: preset.id,
     presetLabel: preset.label,
   });
@@ -924,6 +974,7 @@ export interface EventUpdateInput {
   pricePerLitre?: number;
   isFullTank?: boolean;
   distanceKm?: number;
+  participantMemberIds?: string[];
   recipientMemberId?: string;
   method?: PaymentMethod;
   reference?: string;
@@ -941,14 +992,16 @@ export async function updateEvent(data: GroupData, event: QueueableEvent, input:
   if (event.createdByUserId !== data.currentUserId) throw new Error("You can only correct entries that you recorded.");
   if (data.mode === "cloud") {
     const table = event.kind === "fuel_purchase" ? "fuel_purchases" : event.kind === "ride" ? "rides" : "payments";
-    let update: Record<string, string | number | boolean>;
+    let update: Record<string, string | number | boolean | string[]>;
     if (event.kind === "fuel_purchase") {
       const amount = input.amountRupees ?? event.amountPaise / 100;
       const price = input.pricePerLitre ?? event.unitPricePaisePerLitre / 100;
       update = { amount_paise: Math.round(amount * 100), unit_price_paise_per_litre: Math.round(price * 100), volume_ml: litresFromMoney(amount, price), is_full_tank: input.isFullTank ?? event.isFullTank, occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
     } else if (event.kind === "ride") {
       const distance = input.distanceKm ?? event.distanceM / 1000;
-      update = { distance_m: Math.round(distance * 1000), consumed_ml: fuelForRide(distance, event.efficiencyMPerLitre / 1000), occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
+      const participantMemberIds = input.participantMemberIds ?? event.participantMemberIds;
+      validateRideParticipants(event.riderMemberId, participantMemberIds, data.members.map((member) => member.id));
+      update = { distance_m: Math.round(distance * 1000), consumed_ml: fuelForRide(distance, event.efficiencyMPerLitre / 1000), participant_member_ids: participantMemberIds, occurred_at: input.occurredAt, note: input.note?.trim() ?? "" };
     } else {
       update = { amount_paise: Math.round((input.amountRupees ?? event.amountPaise / 100) * 100), recipient_member_id: input.recipientMemberId ?? event.recipientMemberId, method: input.method ?? event.method, reference: input.reference?.trim() ?? "", occurred_at: input.occurredAt };
     }
@@ -971,7 +1024,9 @@ export async function updateEvent(data: GroupData, event: QueueableEvent, input:
     Object.assign(collection[index], { amountPaise: Math.round(amount * 100), unitPricePaisePerLitre: Math.round(price * 100), volumeMl: litresFromMoney(amount, price), isFullTank: input.isFullTank ?? event.isFullTank, occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
   } else if (event.kind === "ride") {
     const distance = input.distanceKm ?? event.distanceM / 1000;
-    Object.assign(collection[index], { distanceM: Math.round(distance * 1000), consumedMl: fuelForRide(distance, event.efficiencyMPerLitre / 1000), occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
+    const participantMemberIds = input.participantMemberIds ?? event.participantMemberIds;
+    validateRideParticipants(event.riderMemberId, participantMemberIds, data.members.map((member) => member.id));
+    Object.assign(collection[index], { distanceM: Math.round(distance * 1000), consumedMl: fuelForRide(distance, event.efficiencyMPerLitre / 1000), participantMemberIds: [...participantMemberIds], occurredAt: input.occurredAt, note: input.note?.trim() ?? "", updatedAt: new Date().toISOString() });
   } else {
     Object.assign(collection[index], { amountPaise: Math.round((input.amountRupees ?? event.amountPaise / 100) * 100), recipientMemberId: input.recipientMemberId ?? event.recipientMemberId, method: input.method ?? event.method, reference: input.reference?.trim() ?? "", occurredAt: input.occurredAt, updatedAt: new Date().toISOString() });
   }
