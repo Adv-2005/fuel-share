@@ -45,7 +45,7 @@ import { isCloudConfigured } from "@/lib/supabase";
 import type { EventKind, GroupData, LedgerEvent, OpeningBalance, OpeningOwnershipMode, PaymentMethod, Ride, RidePreset, SuggestedTransfer } from "@/lib/types";
 
 type ModalState =
-  | { type: "ride" }
+  | { type: "ride"; preset?: RidePreset }
   | { type: "fuel" }
   | { type: "payment"; transfer?: SuggestedTransfer }
   | { type: "edit"; event: Exclude<LedgerEvent, OpeningBalance> }
@@ -228,6 +228,11 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveAsPreset, setSaveAsPreset] = useState(false);
+  const rideBeingEdited = editing?.kind === "ride" ? editing : null;
+  const driverMemberId = rideBeingEdited?.riderMemberId ?? data.currentMemberId;
+  const [participantMemberIds, setParticipantMemberIds] = useState<string[]>(
+    rideBeingEdited?.participantMemberIds ?? [driverMemberId],
+  );
 
   const title = editing ? "Correct entry" : kind === "ride" ? "Log a ride" : kind === "fuel_purchase" ? "Log a refill" : "Record a repayment";
 
@@ -244,6 +249,7 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           amountRupees: Number(form.get("amount")),
           pricePerLitre: Number(form.get("price")),
           isFullTank: form.get("isFullTank") === "on",
+          participantMemberIds: editing.kind === "ride" ? participantMemberIds : undefined,
           recipientMemberId: String(form.get("recipient")),
           method: (form.get("method") as PaymentMethod | null) ?? undefined,
           reference: String(form.get("reference") ?? ""),
@@ -260,7 +266,14 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
           });
         }
         try {
-          await addRide(data, { distanceKm: Number(form.get("distance")), occurredAt, note: String(form.get("note") ?? "") });
+          await addRide(data, {
+            distanceKm: Number(form.get("distance")),
+            participantMemberIds,
+            occurredAt,
+            note: String(form.get("note") ?? ""),
+            presetId: state.type === "ride" ? state.preset?.id : undefined,
+            presetLabel: state.type === "ride" ? state.preset?.label : undefined,
+          });
         } catch (caught) {
           if (createdPreset) {
             try { await deleteRidePreset(data, createdPreset); } catch { /* Preserve the ride error shown to the member. */ }
@@ -286,13 +299,31 @@ function EntryModal({ state, data, onSaved, onClose }: { state: Exclude<ModalSta
 
   const occurredAt = editing?.occurredAt ?? new Date().toISOString();
   const defaultRecipient = editing?.kind === "payment" ? editing.recipientMemberId : transfer?.toMemberId;
+  const otherMembers = data.members.filter((member) => member.id !== driverMemberId);
+  const participantLimitReached = participantMemberIds.length >= 3;
+
+  function toggleParticipant(memberId: string): void {
+    setParticipantMemberIds((selected) => selected.includes(memberId)
+      ? selected.filter((id) => id !== memberId)
+      : selected.length < 3 ? [...selected, memberId] : selected);
+  }
   return (
     <Modal title={title} onClose={onClose}>
       <form className="entry-form" onSubmit={submit}>
         {kind === "ride" && (
           <>
-            <div className="identity-line"><Bike /><span>{memberName(data, data.currentMemberId)} is riding</span></div>
-            <label>Distance travelled (km)<input name="distance" required autoFocus type="number" min="0.1" max="1000" step="0.1" defaultValue={editing?.kind === "ride" ? editing.distanceM / 1000 : ""} placeholder="12.5" /></label>
+            <div className="identity-line"><Bike /><span>{memberName(data, driverMemberId)} is the driver</span></div>
+            <label>Distance travelled (km)<input name="distance" required autoFocus type="number" min="0.1" max="1000" step="0.1" defaultValue={rideBeingEdited ? rideBeingEdited.distanceM / 1000 : state.type === "ride" && state.preset ? state.preset.distanceM / 1000 : ""} placeholder="12.5" /></label>
+            <fieldset className="ride-participants">
+              <legend>Who rode?</legend>
+              <label className="locked-participant"><input type="checkbox" checked disabled /><span><strong>You / Driver</strong><small>{memberName(data, driverMemberId)}</small></span></label>
+              {otherMembers.map((member) => {
+                const selected = participantMemberIds.includes(member.id);
+                return <label key={member.id}><input type="checkbox" checked={selected} disabled={!selected && participantLimitReached} onChange={() => toggleParticipant(member.id)} /><span>{member.displayName}</span></label>;
+              })}
+              <p>Fuel cost will be split equally among {participantMemberIds.length} rider{participantMemberIds.length === 1 ? "" : "s"}.</p>
+              {participantLimitReached && otherMembers.some((member) => !participantMemberIds.includes(member.id)) && <small>A ride currently supports a maximum of three people.</small>}
+            </fieldset>
             {!editing && (
               <>
                 <label className="check-field"><input name="saveAsPreset" type="checkbox" checked={saveAsPreset} onChange={(event) => setSaveAsPreset(event.currentTarget.checked)} /><span><strong>Save as quick ride</strong><small>Add this distance to your personal one-tap shortcuts.</small></span></label>
@@ -623,10 +654,20 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
         detail: `${formatLitres(event.volumeMl)} at ${formatMoney(event.unitPricePaisePerLitre)}/L${calibrationDetail}`, amount: formatMoney(event.amountPaise),
       };
     }
-    if (event.kind === "ride") return {
-      icon: <Bike />, title: `${memberName(data, event.riderMemberId)} rode${event.presetLabel ? ` ${event.presetLabel}` : ""}`,
-      detail: `${formatLitres(event.consumedMl)} estimated use`, amount: formatDistance(event.distanceM),
-    };
+    if (event.kind === "ride") {
+      const passengerNames = event.participantMemberIds
+        .filter((memberId) => memberId !== event.riderMemberId)
+        .map((memberId) => memberName(data, memberId));
+      const passengerText = passengerNames.length === 0 ? ""
+        : passengerNames.length <= 2 ? ` with ${passengerNames.join(" and ")}`
+          : ` with ${passengerNames[0]} and ${passengerNames.length - 1} others`;
+      return {
+        icon: <Bike />,
+        title: `${memberName(data, event.riderMemberId)} rode${passengerText}${event.presetLabel ? ` · ${event.presetLabel}` : ""}`,
+        detail: `${formatLitres(event.consumedMl)} estimated use`,
+        amount: formatDistance(event.distanceM),
+      };
+    }
     return {
       icon: <IndianRupee />, title: `${memberName(data, event.payerMemberId)} paid ${memberName(data, event.recipientMemberId)}`,
       detail: event.reference || event.method.toUpperCase(), amount: formatMoney(event.amountPaise),
@@ -639,7 +680,11 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
       const ownership = String(previous.ownershipMode ?? previous.ownership_mode ?? "unknown").replace("shared", "Shared opening fuel");
       return `${formatLitres(numberValue("volumeMl", "volume_ml"))} opening fuel worth ${formatMoney(numberValue("amountPaise", "amount_paise"))} · ${ownership}`;
     }
-    if (kind === "ride") return `${formatDistance(numberValue("distanceM", "distance_m"))} ride`;
+    if (kind === "ride") {
+      const ids = (previous.participantMemberIds ?? previous.participant_member_ids) as string[] | undefined;
+      const participants = ids?.map((memberId) => memberName(data, memberId)).join(", ");
+      return `${formatDistance(numberValue("distanceM", "distance_m"))} ride${participants ? ` · ${participants}` : ""}`;
+    }
     if (kind === "fuel_purchase") {
       const wasFullTank = previous.isFullTank === true || previous.is_full_tank === true;
       return `${formatMoney(numberValue("amountPaise", "amount_paise"))} refill at ${formatMoney(numberValue("unitPricePaisePerLitre", "unit_price_paise_per_litre"))}/L${wasFullTank ? " · full-tank calibration" : ""}`;
@@ -705,7 +750,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
               <div className="quick-rides-empty"><p>Add common routes to log rides in one tap.</p><button className="secondary-button" onClick={() => setModal({ type: "presets" })}><Plus /> Add preset</button></div>
             ) : (
               <div className="quick-ride-buttons">
-                {quickRides.map((preset) => <button key={preset.id} disabled={quickBusyId !== null} onClick={() => void logQuickRide(preset)}>{quickBusyId === preset.id ? "Adding…" : <><strong>{preset.label}</strong><span>· {formatDistance(preset.distanceM)}</span></>}</button>)}
+                {quickRides.map((preset) => <div className="quick-ride-option" key={preset.id}><button disabled={quickBusyId !== null} onClick={() => void logQuickRide(preset)}>{quickBusyId === preset.id ? "Adding…" : <><strong>{preset.label}</strong><span>· {formatDistance(preset.distanceM)}</span></>}</button><button className="with-people-button" onClick={() => setModal({ type: "ride", preset })}>Log with people</button></div>)}
                 <button className="add-preset-button" onClick={() => setModal({ type: "presets" })}><Plus /> Add</button>
               </div>
             )}
@@ -782,7 +827,7 @@ function Dashboard({ data, onRefresh }: { data: GroupData; onRefresh: () => Prom
             {snapshot.memberBalances.map((balance) => (
               <article className="person-row" key={balance.memberId}>
                 <span className="avatar static">{memberName(data, balance.memberId).slice(0, 1)}</span>
-                <div><strong>{memberName(data, balance.memberId)}{balance.memberId === data.currentMemberId ? " (you)" : ""}</strong><small>{formatDistance(balance.distanceM)} ridden · {formatMoney(balance.rideCostPaise)} used</small></div>
+                <div><strong>{memberName(data, balance.memberId)}{balance.memberId === data.currentMemberId ? " (you)" : ""}</strong><small>{formatDistance(balance.distanceM)} participated · {formatMoney(balance.rideCostPaise)} used</small></div>
                 <div className={balance.balancePaise > 0 ? "balance positive" : balance.balancePaise < 0 ? "balance negative" : "balance"}>
                   {balance.balancePaise > 0 ? <ArrowDownLeft /> : balance.balancePaise < 0 ? <ArrowUpRight /> : <Check />}
                   <span>{balance.balancePaise > 0 ? "gets " : balance.balancePaise < 0 ? "owes " : "settled"}{balance.balancePaise !== 0 && formatMoney(Math.abs(balance.balancePaise))}</span>

@@ -123,10 +123,12 @@ input:focus, select:focus { border-color: var(--mint-strong); box-shadow: 0 0 0 
 .quick-rides-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .75rem; }
 .quick-rides-heading h2 { margin: 0; font-size: 1.05rem; }
 .quick-ride-buttons { display: flex; flex-wrap: wrap; gap: .55rem; }
-.quick-ride-buttons > button { min-height: 2.65rem; padding: .6rem .8rem; border: 1px solid #b9d5c7; border-radius: .8rem; display: inline-flex; align-items: center; gap: .3rem; background: var(--mint); cursor: pointer; }
-.quick-ride-buttons > button:disabled { cursor: wait; opacity: .65; }
+.quick-ride-buttons > button, .quick-ride-option > button { min-height: 2.65rem; padding: .6rem .8rem; border: 1px solid #b9d5c7; border-radius: .8rem; display: inline-flex; align-items: center; gap: .3rem; background: var(--mint); cursor: pointer; }
+.quick-ride-buttons button:disabled { cursor: wait; opacity: .65; }
 .quick-ride-buttons span { color: var(--ink-soft); }
 .quick-ride-buttons .add-preset-button { border-style: dashed; background: transparent; }
+.quick-ride-option { display: grid; gap: .25rem; }
+.quick-ride-option .with-people-button { min-height: auto; padding: .2rem .45rem; border: 0; background: transparent; color: var(--ink-soft); font-size: .68rem; font-weight: 800; }
 .quick-ride-buttons svg, .quick-rides-empty svg { width: 1rem; }
 .quick-rides-empty { padding: .8rem; border-radius: .9rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: rgba(255,255,255,.55); }
 .quick-rides-empty p { margin: 0; color: var(--ink-soft); font-size: .85rem; }
@@ -207,6 +209,14 @@ input:focus, select:focus { border-color: var(--mint-strong); box-shadow: 0 0 0 
 .check-field input { width: 1.15rem; min-height: 1.15rem; margin: .15rem 0 0; accent-color: var(--ink); }
 .check-field span { display: grid; gap: .2rem; color: var(--ink); }
 .check-field small { color: var(--ink-soft); font-weight: 500; line-height: 1.4; }
+.ride-participants { margin: 0; padding: .85rem; border: 1px solid var(--line); border-radius: .8rem; display: grid; gap: .65rem; background: #fff; }
+.ride-participants legend { padding: 0 .3rem; font-weight: 800; }
+.ride-participants label { grid-template-columns: auto 1fr; align-items: center; gap: .65rem; cursor: pointer; }
+.ride-participants input { width: 1.1rem; min-height: 1.1rem; accent-color: var(--ink); }
+.ride-participants label span { display: grid; gap: .1rem; }
+.ride-participants label small, .ride-participants > small { color: var(--ink-soft); font-weight: 500; }
+.ride-participants p { margin: .2rem 0 0; color: var(--ink-soft); font-size: .8rem; }
+.ride-participants .locked-participant { cursor: default; }
 .calibration-note { margin: .8rem 0 0; padding: .75rem .9rem; display: flex; align-items: center; gap: .6rem; border-radius: .8rem; background: var(--mint); color: var(--ink-soft); font-size: .8rem; }
 .calibration-note svg { width: 1rem; flex: 0 0 auto; color: var(--ink); }
 

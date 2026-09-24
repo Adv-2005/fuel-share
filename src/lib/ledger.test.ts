@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateLedger, equalOwnershipShares, fuelForRide, litresFromMoney } from "@/lib/ledger";
+import { calculateLedger, equalOwnershipShares, fuelForRide, litresFromMoney, splitRideCost } from "@/lib/ledger";
 import type { FuelPurchase, Group, Member, OpeningBalance, Ride, SettlementPayment } from "@/lib/types";
 
 const group: Group = {
@@ -31,6 +31,7 @@ function purchase(overrides: Partial<FuelPurchase> = {}): FuelPurchase {
 function ride(overrides: Partial<Ride> = {}): Ride {
   return {
     id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "bob", createdByUserId: "bob-user",
+    participantMemberIds: overrides.participantMemberIds ?? [overrides.riderMemberId ?? "bob"],
     distanceM: 45_000, efficiencyMPerLitre: 45_000, consumedMl: 1_000,
     presetId: null, presetLabel: null,
     occurredAt: "2026-01-02T10:00:00.000Z", createdAt: group.createdAt, updatedAt: group.createdAt, deletedAt: null, note: "", ...overrides,
@@ -77,6 +78,81 @@ it("allocates fuel FIFO at each purchase price", () => {
   expect(result.memberBalances.find((item) => item.memberId === "alice")?.balancePaise).toBe(20_000);
   expect(result.memberBalances.find((item) => item.memberId === "cara")?.balancePaise).toBe(12_000);
   expect(result.tank.remainingValuePaise).toBe(24_000);
+});
+
+describe("shared rides", () => {
+  it("keeps solo ride accounting unchanged", () => {
+    const result = calculateLedger(group, members, [purchase()], [ride()], []);
+    expect(result.tank.remainingMl).toBe(4_000);
+    expect(result.memberBalances.find((item) => item.memberId === "bob")).toMatchObject({
+      balancePaise: -10_000, rideCostPaise: 10_000, distanceM: 45_000,
+    });
+  });
+
+  it("splits a two-person ride when the fuel owner did not ride", () => {
+    const result = calculateLedger(group, members, [purchase()], [ride({ participantMemberIds: ["bob", "cara"] })], []);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance]));
+    expect(balances.get("alice")?.balancePaise).toBe(10_000);
+    expect(balances.get("bob")).toMatchObject({ balancePaise: -5_000, rideCostPaise: 5_000 });
+    expect(balances.get("cara")).toMatchObject({ balancePaise: -5_000, rideCostPaise: 5_000 });
+  });
+
+  it("does not charge a participant for their own fuel share", () => {
+    const result = calculateLedger(group, members, [purchase()], [ride({
+      riderMemberId: "alice", participantMemberIds: ["alice", "bob"],
+    })], []);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance]));
+    expect(balances.get("alice")).toMatchObject({ balancePaise: 5_000, rideCostPaise: 5_000 });
+    expect(balances.get("bob")).toMatchObject({ balancePaise: -5_000, rideCostPaise: 5_000 });
+    expect(result.suggestedTransfers).toEqual([{ fromMemberId: "bob", toMemberId: "alice", amountPaise: 5_000 }]);
+  });
+
+  it("splits three ways with the leftover paise going to the driver", () => {
+    const dev: Member = { id: "dev", groupId: "group", userId: "dev-user", displayName: "Dev", role: "member", createdAt: group.createdAt };
+    const tinyPurchase = purchase({ amountPaise: 100, volumeMl: 1_000 });
+    const result = calculateLedger(group, [...members, dev], [tinyPurchase], [ride({
+      consumedMl: 1_000, participantMemberIds: ["bob", "dev", "cara"],
+    })], []);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance]));
+    expect(balances.get("alice")?.balancePaise).toBe(100);
+    expect(balances.get("bob")?.rideCostPaise).toBe(34);
+    expect(balances.get("cara")?.rideCostPaise).toBe(33);
+    expect(balances.get("dev")?.rideCostPaise).toBe(33);
+  });
+
+  it("splits each differently priced fuel lot and consumes distance only once", () => {
+    const purchases = [
+      purchase({ id: "cheap", amountPaise: 20_000, volumeMl: 2_000 }),
+      purchase({ id: "expensive", payerMemberId: "cara", createdByUserId: "cara-user", amountPaise: 36_000, unitPricePaisePerLitre: 12_000, volumeMl: 3_000, occurredAt: "2026-01-02T08:00:00.000Z" }),
+    ];
+    const result = calculateLedger(group, members, purchases, [ride({
+      distanceM: 135_000, consumedMl: 3_000, participantMemberIds: ["bob", "cara"], occurredAt: "2026-01-03T10:00:00.000Z",
+    })], []);
+    const balances = new Map(result.memberBalances.map((balance) => [balance.memberId, balance]));
+    expect(result.tank.remainingMl).toBe(2_000);
+    expect(balances.get("alice")?.balancePaise).toBe(20_000);
+    expect(balances.get("bob")).toMatchObject({ balancePaise: -16_000, rideCostPaise: 16_000, distanceM: 135_000 });
+    expect(balances.get("cara")).toMatchObject({ balancePaise: -4_000, rideCostPaise: 16_000, distanceM: 135_000 });
+  });
+
+  it("uses deterministic exact-paise rounding for two and three participants", () => {
+    expect(splitRideCost(101, "bob", ["cara", "bob"])).toEqual([
+      { memberId: "bob", amountPaise: 51 }, { memberId: "cara", amountPaise: 50 },
+    ]);
+    expect(splitRideCost(100, "bob", ["dev", "bob", "cara"])).toEqual([
+      { memberId: "bob", amountPaise: 34 },
+      { memberId: "cara", amountPaise: 33 },
+      { memberId: "dev", amountPaise: 33 },
+    ]);
+    expect(splitRideCost(10_003, "bob", ["dev", "bob", "cara"]).reduce((sum, share) => sum + share.amountPaise, 0)).toBe(10_003);
+  });
+
+  it("keeps balances zero-sum and gives every participant the full distance", () => {
+    const result = calculateLedger(group, members, [purchase()], [ride({ participantMemberIds: ["bob", "cara"] })], []);
+    expect(result.memberBalances.reduce((sum, balance) => sum + balance.balancePaise, 0)).toBe(0);
+    expect(result.memberBalances.find((balance) => balance.memberId === "bob")?.distanceM).toBe(45_000);
+    expect(result.memberBalances.find((balance) => balance.memberId === "cara")?.distanceM).toBe(45_000);
+  });
 });
 
 describe("full-tank calibration", () => {

@@ -12,7 +12,9 @@ import {
   moveRidePreset,
   saveOpeningBalance,
   selectAccessibleGroupId,
+  updateEvent,
   updateRidePreset,
+  validateRideParticipants,
   validateOpeningBalanceInput,
   voidRide,
 } from "@/lib/repository";
@@ -222,6 +224,7 @@ describe("ride presets", () => {
     vi.mocked(getSupabase).mockReturnValue({ from } as unknown as ReturnType<typeof getSupabase>);
     const ride: Ride = {
       id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "alice", createdByUserId: "alice-user",
+      participantMemberIds: ["alice"],
       distanceM: 8_000, efficiencyMPerLitre: 40_000, consumedMl: 200, presetId: "deleted-preset",
       presetLabel: "College", occurredAt: now, createdAt: now, updatedAt: now, deletedAt: null, note: "stale note",
     };
@@ -264,6 +267,100 @@ describe("ride presets", () => {
   });
 });
 
+describe("shared rides", () => {
+  const sharedMembers = [member("alice", "alice-user"), member("bob", "bob-user"), member("cara", "cara-user"), member("dev", "dev-user")];
+
+  function storedRide(participantMemberIds = ["alice"]): Ride {
+    return {
+      id: "ride-1", kind: "ride", groupId: "group", riderMemberId: "alice", participantMemberIds,
+      createdByUserId: "alice-user", distanceM: 8_000, efficiencyMPerLitre: 40_000, consumedMl: 200,
+      presetId: null, presetLabel: null, occurredAt: "2026-01-02T00:00:00.000Z", createdAt: now,
+      updatedAt: now, deletedAt: null, note: "",
+    };
+  }
+
+  it("validates empty, duplicate, missing-driver, oversized, and cross-group participant lists", () => {
+    const joined = sharedMembers.map((entry) => entry.id);
+    expect(() => validateRideParticipants("alice", [], joined)).toThrow("at least one");
+    expect(() => validateRideParticipants("alice", ["alice", "bob", "bob"], joined)).toThrow("unique");
+    expect(() => validateRideParticipants("alice", ["bob"], joined)).toThrow("driver");
+    expect(() => validateRideParticipants("alice", ["alice", "bob", "cara", "dev"], joined)).toThrow("at most three");
+    expect(() => validateRideParticipants("alice", ["alice", "outsider"], joined)).toThrow("this group");
+  });
+
+  it("stores shared participants in local mode", async () => {
+    const data = groupData({ members: sharedMembers });
+    seedLocal(data);
+    const result = await addRide(data, {
+      distanceKm: 8, participantMemberIds: ["alice", "bob", "cara"], occurredAt: "2026-01-02T00:00:00.000Z",
+    });
+    const loaded = await loadCurrentGroup("group");
+    expect(result.ride).toMatchObject({ participantMemberIds: ["alice", "bob", "cara"], consumedMl: 200 });
+    expect(loaded?.rides[0].participantMemberIds).toEqual(["alice", "bob", "cara"]);
+  });
+
+  it("queues all shared participants for offline cloud sync", async () => {
+    vi.spyOn(window.navigator, "onLine", "get").mockReturnValue(false);
+    const data = groupData({ mode: "cloud", members: sharedMembers });
+    const result = await addRide(data, {
+      distanceKm: 8, participantMemberIds: ["alice", "bob"], occurredAt: "2026-01-02T00:00:00.000Z",
+    });
+    const pending = JSON.parse(localStorage.getItem("fuelshare_pending_actions_v1") ?? "[]") as Array<{ event: Ride }>;
+    expect(result.pendingSync).toBe(true);
+    expect(pending[0].event.participantMemberIds).toEqual(["alice", "bob"]);
+  });
+
+  it("migrates legacy local rides to their original rider", async () => {
+    const data = groupData();
+    seedLocal(data);
+    const database = JSON.parse(localStorage.getItem("fuelshare_database_v1") ?? "{}") as { rides: Array<Record<string, unknown>> };
+    const legacyRide = { ...storedRide() } as unknown as Record<string, unknown>;
+    delete legacyRide.participantMemberIds;
+    database.rides = [legacyRide];
+    localStorage.setItem("fuelshare_database_v1", JSON.stringify(database));
+    const loaded = await loadCurrentGroup("group");
+    expect(loaded?.rides[0].participantMemberIds).toEqual(["alice"]);
+  });
+
+  it("edits a solo ride to shared and preserves the old participants in revision history", async () => {
+    const original = storedRide();
+    const data = groupData({ members: sharedMembers, rides: [original] });
+    seedLocal(data);
+    await updateEvent(data, original, {
+      distanceKm: 8, participantMemberIds: ["alice", "bob"], occurredAt: original.occurredAt,
+    });
+    const loaded = await loadCurrentGroup("group");
+    expect(loaded?.rides[0].participantMemberIds).toEqual(["alice", "bob"]);
+    expect(loaded?.revisions[0].previousData.participantMemberIds).toEqual(["alice"]);
+  });
+
+  it("edits a shared ride back to solo and preserves the shared revision", async () => {
+    const original = storedRide(["alice", "bob"]);
+    const data = groupData({ members: sharedMembers, rides: [original] });
+    seedLocal(data);
+    await updateEvent(data, original, {
+      distanceKm: 8, participantMemberIds: ["alice"], occurredAt: original.occurredAt,
+    });
+    const loaded = await loadCurrentGroup("group");
+    expect(loaded?.rides[0].participantMemberIds).toEqual(["alice"]);
+    expect(loaded?.revisions[0].previousData.participantMemberIds).toEqual(["alice", "bob"]);
+  });
+
+  it("defines an additive database migration with backfill and server-side validation", () => {
+    const migration = readFileSync("supabase/migrations/007_shared_rides.sql", "utf8");
+    const auditMigration = readFileSync("supabase/migrations/006_preserve_ride_preset_snapshots.sql", "utf8");
+    expect(migration).toContain("add column if not exists participant_member_ids uuid[]");
+    expect(migration).toMatch(/disable trigger rides_audit[\s\S]*set participant_member_ids = array\[rider_member_id\][\s\S]*enable trigger rides_audit/);
+    expect(migration).toMatch(/disable trigger rides_set_updated_at[\s\S]*enable trigger rides_set_updated_at/);
+    expect(migration).toContain("set participant_member_ids = array[rider_member_id]");
+    expect(migration).toContain("alter column participant_member_ids set not null");
+    expect(migration).toContain("create trigger rides_validate_participants");
+    expect(migration).toContain("count(distinct participant_id)");
+    expect(migration).toContain("id = any(new.participant_member_ids)");
+    expect(auditMigration).toContain("to_jsonb(old)");
+  });
+});
+
 describe("opening balance validation", () => {
   it("rejects opening fuel above tank capacity", () => {
     expect(() => validateOpeningBalanceInput({
@@ -294,7 +391,7 @@ describe("opening balance validation", () => {
       groupName: "Flat", vehicleName: "Activa", displayName: "Alice", tankCapacityLitres: 10, mileageKmPerLitre: 45,
       opening: { state: "existing", volumeLitres: 2, pricePerLitre: 100, ownershipMode: "single" },
     });
-    await addRide(data, { distanceKm: 67.5, occurredAt: "2099-01-01T00:00:00.000Z" });
+    await addRide(data, { distanceKm: 67.5, participantMemberIds: [data.currentMemberId], occurredAt: "2099-01-01T00:00:00.000Z" });
     const fresh = await loadCurrentGroup(data.group.id);
     await expect(saveOpeningBalance(fresh!, {
       volumeLitres: 1, pricePerLitre: 100, ownershipMode: "single", ownerMemberIds: [data.currentMemberId],

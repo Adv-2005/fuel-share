@@ -118,6 +118,25 @@ export function equalOwnershipShares(memberIds: string[]): OpeningOwnerShare[] {
   return uniqueIds.map((memberId, index) => ({ memberId, shareBasisPoints: base + (index < remainder ? 1 : 0) }));
 }
 
+/** Split a fuel-lot cost in paise, with remainder going to the driver first. */
+export function splitRideCost(
+  costPaise: number,
+  driverMemberId: string,
+  participantMemberIds: string[],
+): Array<{ memberId: string; amountPaise: number }> {
+  const additionalParticipants = participantMemberIds
+    .filter((memberId) => memberId !== driverMemberId)
+    .sort((a, b) => a.localeCompare(b));
+  const orderedParticipants = [driverMemberId, ...additionalParticipants];
+  if (orderedParticipants.length === 0) return [];
+  const baseShare = Math.floor(costPaise / orderedParticipants.length);
+  const remainder = costPaise - baseShare * orderedParticipants.length;
+  return orderedParticipants.map((memberId, index) => ({
+    memberId,
+    amountPaise: baseShare + (index < remainder ? 1 : 0),
+  }));
+}
+
 function buildTransfers(balances: MemberBalance[], memberNames: Map<string, string>): SuggestedTransfer[] {
   const debtors = balances
     .filter((item) => item.balancePaise < 0)
@@ -223,8 +242,13 @@ export function calculateLedger(
     }
 
     const ride = event.value;
-    const riderBalance = balances.get(ride.riderMemberId);
-    if (riderBalance) riderBalance.distanceM += ride.distanceM;
+    const participantMemberIds = ride.participantMemberIds?.length
+      ? ride.participantMemberIds
+      : [ride.riderMemberId];
+    for (const participantId of participantMemberIds) {
+      const participantBalance = balances.get(participantId);
+      if (participantBalance) participantBalance.distanceM += ride.distanceM;
+    }
     let requiredMl = ride.consumedMl;
     tankMl -= requiredMl;
     if (tankMl < 0) issues.push({
@@ -247,12 +271,15 @@ export function calculateLedger(
       requiredMl -= consumedMl;
 
       for (const allocation of ownerAllocations) {
-        if (allocation.memberId === ride.riderMemberId) continue;
         const ownerBalance = balances.get(allocation.memberId);
         if (ownerBalance) ownerBalance.balancePaise += allocation.amount;
-        if (riderBalance) riderBalance.balancePaise -= allocation.amount;
       }
-      if (riderBalance) riderBalance.rideCostPaise += consumedCost;
+      for (const share of splitRideCost(consumedCost, ride.riderMemberId, participantMemberIds)) {
+        const participantBalance = balances.get(share.memberId);
+        if (participantBalance) participantBalance.rideCostPaise += share.amountPaise;
+        // Unowned shared opening fuel has a cost for statistics, but creates no debt.
+        if (participantBalance && ownerAllocations.length > 0) participantBalance.balancePaise -= share.amountPaise;
+      }
     }
   }
 
